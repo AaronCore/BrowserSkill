@@ -480,7 +480,8 @@ fn serve(cfg: &DaemonConfig) -> Result<Stopped> {
             sock_path.clone(),
             ws_port,
             env!("CARGO_PKG_VERSION"),
-        );
+        )
+        .with_host_managed(!cfg.detached);
         daemon_info::write(&info).context("write daemon.json")?;
         info!(
             pid = info.pid,

@@ -169,5 +169,13 @@ fn foreground_daemon_reports_updates_without_replacing_itself() {
     // The CLI hint follows the daemon's policy, not the CLI's own switch.
     let status = bsk(&home, &server).arg("status").output().unwrap();
     let stderr = String::from_utf8_lossy(&status.stderr);
-    assert!(stderr.contains("999.0.0. Run `bsk update`."), "{stderr}");
+    assert!(
+        stderr.contains(
+            "999.0.0. Run `bsk update`, then restart the daemon in its terminal or supervisor."
+        ),
+        "{stderr}"
+    );
+    let info: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("daemon.json")).unwrap()).unwrap();
+    assert_eq!(info["host_managed"], true, "{info}");
 }

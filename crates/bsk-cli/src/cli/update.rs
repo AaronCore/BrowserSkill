@@ -80,7 +80,25 @@ struct UpdateReport {
     release_url: Option<String>,
     asset_url: Option<String>,
     install_action: Option<&'static str>,
+    /// What happened to a running daemon: `restarted`, `not_running`, or
+    /// `left_to_host` for one its terminal or supervisor must restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon: Option<&'static str>,
     message: String,
+}
+
+/// What `bsk update` did with the daemon after installing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonRestart {
+    /// `--no-restart-daemon`: a running daemon was not looked at.
+    NotRequested,
+    NotRunning,
+    Restarted,
+    /// The daemon belongs to its terminal or supervisor and keeps running the
+    /// previous version until its owner restarts it.
+    LeftToHost {
+        pid: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +241,7 @@ fn run(args: UpdateArgs, format: Format) -> Result<()> {
                 release_url: manifest.release_url,
                 asset_url: None,
                 install_action: None,
+                daemon: None,
                 message: format!("bsk {current_version} is already up to date"),
             },
         );
@@ -238,6 +257,7 @@ fn run(args: UpdateArgs, format: Format) -> Result<()> {
                 release_url: candidate.release_url.clone(),
                 asset_url: Some(candidate.asset.url.clone()),
                 install_action: None,
+                daemon: None,
                 message: format!(
                     "bsk {} is available (current {})",
                     candidate.latest, candidate.current
@@ -256,12 +276,29 @@ fn run(args: UpdateArgs, format: Format) -> Result<()> {
                 release_url: candidate.release_url,
                 asset_url: Some(candidate.asset.url),
                 install_action: None,
+                daemon: None,
                 message: "update cancelled".to_string(),
             },
         );
     }
 
-    install_candidate_with_client(&candidate, args.restart_daemon, &client)?;
+    let restart = install_candidate_with_client(&candidate, args.restart_daemon, &client)?;
+    let updated = format!(
+        "updated bsk from {} to {}",
+        candidate.current, candidate.latest
+    );
+    let (daemon, message) = match restart {
+        DaemonRestart::NotRequested => (None, updated),
+        DaemonRestart::NotRunning => (Some("not_running"), updated),
+        DaemonRestart::Restarted => (Some("restarted"), updated),
+        DaemonRestart::LeftToHost { pid } => (
+            Some("left_to_host"),
+            format!(
+                "{updated}; the daemon (pid {pid}) belongs to its terminal or supervisor and still runs {}: restart it there to use {}",
+                candidate.current, candidate.latest
+            ),
+        ),
+    };
     render_report(
         format,
         &UpdateReport {
@@ -271,10 +308,8 @@ fn run(args: UpdateArgs, format: Format) -> Result<()> {
             release_url: candidate.release_url,
             asset_url: Some(candidate.asset.url),
             install_action: Some("replaced"),
-            message: format!(
-                "updated bsk from {} to {}",
-                candidate.current, candidate.latest
-            ),
+            daemon,
+            message,
         },
     )
 }
@@ -329,14 +364,17 @@ fn fetch_manifest_with_client(
 }
 
 /// `bsk update`: install and self-check the new executable while any daemon
-/// keeps serving, and only then restart that daemon from it. If the new
-/// daemon does not become ready, put the previous executable back and restart
-/// the daemon from that.
+/// keeps serving, and only then restart that daemon from it, on the same
+/// port. If the new daemon does not become ready, put the previous executable
+/// back and restart the daemon from that. A daemon owned by a terminal or
+/// supervisor is left running: stopping it here would either take it away
+/// from its owner or, inside a host that forbids Job breakaway, leave no
+/// daemon at all.
 fn install_candidate_with_client(
     candidate: &UpdateCandidate,
     restart_daemon: bool,
     client: &reqwest::blocking::Client,
-) -> Result<()> {
+) -> Result<DaemonRestart> {
     let target = std::env::current_exe().context("locate current bsk executable")?;
     if let Err(err) = ensure_replaceable(&target) {
         UpdateRecord::skipped(
@@ -354,6 +392,12 @@ fn install_candidate_with_client(
     record.save();
     let installed = install_verified(candidate, &target, client, &mut record)?;
 
+    let running = restart_daemon.then(running_daemon).flatten();
+    if let Some(daemon) = running.as_ref().filter(|daemon| daemon.host_managed) {
+        record.succeed(None);
+        installed.discard();
+        return Ok(DaemonRestart::LeftToHost { pid: daemon.pid });
+    }
     let daemon_was_running = match restart_daemon
         .then(crate::daemon::start::stop_if_running)
         .transpose()
@@ -368,18 +412,26 @@ fn install_candidate_with_client(
     if !daemon_was_running {
         record.succeed(None);
         installed.discard();
-        return Ok(());
+        return Ok(if restart_daemon {
+            DaemonRestart::NotRunning
+        } else {
+            DaemonRestart::NotRequested
+        });
     }
 
     record.enter(UpdateStage::Restart);
+    let args = StartArgs {
+        port: running.map(|daemon| daemon.ws_port),
+        ..StartArgs::default()
+    };
     // Start from `target`: once it is replaced, Linux no longer reports it as
     // the current executable.
-    let start = || crate::daemon::start::start_detached(&target, &StartArgs::default());
+    let start = || crate::daemon::start::start_detached(&target, &args);
     match start() {
         Ok(daemon) => {
             record.succeed(Some((daemon.pid, daemon.version)));
             installed.discard();
-            Ok(())
+            Ok(DaemonRestart::Restarted)
         }
         Err(err) => {
             let err = err.context("restart the daemon from the new version");
@@ -397,6 +449,16 @@ fn install_candidate_with_client(
                 Err(err)
             }
         }
+    }
+}
+
+/// The daemon answering on this bsk home, if one does. Errors are left to
+/// the stop that follows, which reports them.
+fn running_daemon() -> Option<crate::daemon::info::DaemonInfo> {
+    use crate::daemon::probe::{self, PROBE_TIMEOUT, Probe};
+    match probe::probe(PROBE_TIMEOUT) {
+        Ok(Probe::Ready(daemon)) => Some(daemon.info),
+        _ => None,
     }
 }
 
@@ -600,6 +662,8 @@ pub fn update_hint_for_manifest(
 enum HintAction<'a> {
     Daemon,
     Command,
+    /// `bsk update`, then a restart by the daemon's terminal or supervisor.
+    CommandThenHost,
     /// bsk cannot write next to this executable.
     Installer(&'a Path),
 }
@@ -632,6 +696,9 @@ fn update_hint_text(current: &Version, latest: &Version, action: HintAction<'_>)
     match action {
         HintAction::Daemon => format!("{available} The daemon will upgrade bsk automatically."),
         HintAction::Command => format!("{available} Run `bsk update`."),
+        HintAction::CommandThenHost => format!(
+            "{available} Run `bsk update`, then restart the daemon in its terminal or supervisor."
+        ),
         HintAction::Installer(target) => format!(
             "{available} bsk cannot write next to {}; {}.",
             target.display(),
@@ -768,8 +835,8 @@ pub fn print_update_hint_from_cache(flags: &super::GlobalFlags, command: &super:
 
 /// The hint to show for a cache file: only when the cache is present,
 /// fresh, and names a version newer than `current_version`. The daemon's
-/// recorded policy wins over this process's `auto_update` switch, and a
-/// recorded unwritable installation over both.
+/// recorded policy wins over this process's `auto_update` switch, and the
+/// reason it recorded for skipping the version over both.
 fn cached_update_hint(
     cache_path: &Path,
     current_version: &str,
@@ -783,14 +850,18 @@ fn cached_update_hint(
     if !cache.is_fresh(now_epoch_secs, UPDATE_CHECK_INTERVAL) {
         return Ok(None);
     }
-    let installer = Version::parse(cache.latest_version.trim_start_matches('v'))
+    let skipped = Version::parse(cache.latest_version.trim_start_matches('v'))
         .ok()
-        .and_then(|latest| {
-            last_attempt.filter(|record| record.skips(&latest, SkipReason::NotWritable))
-        })
-        .map(|record| record.executable.as_path());
-    let action = match installer {
-        Some(target) => HintAction::Installer(target),
+        .zip(last_attempt)
+        .and_then(|(latest, record)| {
+            [SkipReason::NotWritable, SkipReason::HostManaged]
+                .into_iter()
+                .find(|reason| record.skips(&latest, *reason))
+                .map(|reason| (reason, record))
+        });
+    let action = match skipped {
+        Some((SkipReason::NotWritable, record)) => HintAction::Installer(&record.executable),
+        Some((SkipReason::HostManaged, _)) => HintAction::CommandThenHost,
         None => HintAction::from_auto_update(cache.auto_update.unwrap_or(auto_update)),
     };
     Ok(update_hint_for_cache(&cache, current_version, action))
@@ -1699,6 +1770,23 @@ mod tests {
         );
         assert!(hint.contains("/opt/bsk/bin/bsk"), "{hint}");
         assert!(hint.contains("installer or package manager"), "{hint}");
+
+        let host_managed = UpdateRecord::skipped(
+            UpdateSource::Daemon,
+            &LATEST,
+            exe,
+            SkipReason::HostManaged,
+            None,
+        );
+        let hint = cached_update_hint(&path, "0.1.7", now, true, Some(&host_managed))
+            .unwrap()
+            .unwrap();
+        assert!(
+            hint.ends_with(
+                "Run `bsk update`, then restart the daemon in its terminal or supervisor."
+            ),
+            "{hint}"
+        );
 
         // A record about another version does not change the advice.
         let hint = cached_update_hint(

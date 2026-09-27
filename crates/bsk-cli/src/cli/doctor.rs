@@ -170,6 +170,8 @@ enum DaemonState {
     Verified {
         status: StatusResult,
         local_identity_error: Option<String>,
+        /// Owned by a terminal or supervisor, which must restart it.
+        host_managed: bool,
     },
 }
 
@@ -180,6 +182,16 @@ impl DaemonState {
             _ => None,
         }
     }
+
+    fn host_managed(&self) -> bool {
+        matches!(
+            self,
+            DaemonState::Verified {
+                host_managed: true,
+                ..
+            }
+        )
+    }
 }
 
 fn collect_checks(state: DaemonState) -> Vec<CheckResult> {
@@ -189,7 +201,7 @@ fn collect_checks(state: DaemonState) -> Vec<CheckResult> {
         check_daemon_running(&state),
         check_daemon_management(&state),
         check_version_compatible(state.status()),
-        check_auto_update(state.status()),
+        check_auto_update(state.status(), state.host_managed()),
         check_extension_connected(state.status()),
         check_browsers_protocol_compatible(state.status()),
     ]
@@ -198,13 +210,13 @@ fn collect_checks(state: DaemonState) -> Vec<CheckResult> {
 /// An attempt still `in_progress` after this long was interrupted.
 const UPDATE_STALLED_AFTER_SECS: u64 = 10 * 60;
 
-fn check_auto_update(status: Option<&StatusResult>) -> CheckResult {
+fn check_auto_update(status: Option<&StatusResult>, host_managed: bool) -> CheckResult {
     let leftovers = std::env::current_exe()
         .map(|exe| update::update_leftovers(&exe))
         .unwrap_or_default();
     auto_update_check(
         update::state::current().as_ref(),
-        status.map(|status| status.daemon_version.as_str()),
+        status.map(|status| (status.daemon_version.as_str(), host_managed)),
         env!("CARGO_PKG_VERSION"),
         &leftovers,
         update::now_epoch_secs(),
@@ -212,10 +224,11 @@ fn check_auto_update(status: Option<&StatusResult>) -> CheckResult {
 }
 
 /// Report the recorded update attempt as it happened, rather than inferring
-/// it from which versions exist.
+/// it from which versions exist. `daemon` is the running daemon's version and
+/// whether its terminal or supervisor owns it.
 fn auto_update_check(
     record: Option<&UpdateRecord>,
-    daemon_version: Option<&str>,
+    daemon: Option<(&str, bool)>,
     installed_version: &str,
     leftovers: &[update::Leftover],
     now: u64,
@@ -223,13 +236,18 @@ fn auto_update_check(
     let name = "auto-update";
     let mut details = Vec::new();
     let mut hints = Vec::new();
-    if let Some(daemon_version) = daemon_version.filter(|version| *version != installed_version) {
+    if let Some((daemon_version, host_managed)) =
+        daemon.filter(|(version, _)| *version != installed_version)
+    {
         details.push(format!(
             "the daemon runs bsk {daemon_version}, the installed bsk is {installed_version}"
         ));
-        hints.push(
-            "restart the daemon with `bsk daemon restart` to run the installed version".to_string(),
-        );
+        hints.push(if host_managed {
+            "restart the daemon in its terminal or supervisor to run the installed version"
+                .to_string()
+        } else {
+            "restart the daemon with `bsk daemon restart` to run the installed version".to_string()
+        });
     }
     match record {
         None => details.push("no update attempt recorded".to_string()),
@@ -346,8 +364,13 @@ fn describe_update(
             });
             if !superseded {
                 hints.push(match record.skip_reason {
-                    Some(SkipReason::HostManaged) => "stop the host task, run `bsk update --yes --no-restart-daemon`, then start the task again".to_string(),
-                    Some(SkipReason::NotWritable) | None => update::installer_hint(&record.executable),
+                    Some(SkipReason::HostManaged) => {
+                        "run `bsk update`, then restart the daemon in its terminal or supervisor"
+                            .to_string()
+                    }
+                    Some(SkipReason::NotWritable) | None => {
+                        update::installer_hint(&record.executable)
+                    }
                 });
             }
         }
@@ -378,6 +401,7 @@ fn current_state(browser_wait: Duration) -> DaemonState {
                 .require_local_pid()
                 .err()
                 .map(|err| format!("{err:#}")),
+            host_managed: daemon.info.host_managed,
             status: daemon.status,
         },
         Ok(Probe::Absent(Some(info))) => DaemonState::NoListener(info),
@@ -722,7 +746,7 @@ mod m2_tests {
     }
 
     fn update_check(record: Option<&UpdateRecord>, daemon: Option<&str>) -> CheckResult {
-        auto_update_check(record, daemon, "0.3.1", &[], 1_120)
+        auto_update_check(record, daemon.map(|v| (v, false)), "0.3.1", &[], 1_120)
     }
 
     #[test]
@@ -746,6 +770,12 @@ mod m2_tests {
         assert!(skewed.detail.contains("the daemon runs bsk 0.3.0"));
         assert!(skewed.hint.unwrap().contains("bsk daemon restart"));
         assert!(!has_failures(&[update_check(None, Some("0.3.0"))]));
+
+        // A daemon its terminal or supervisor owns is restarted there.
+        let host = auto_update_check(None, Some(("0.3.0", true)), "0.3.1", &[], 0);
+        let hint = host.hint.unwrap();
+        assert!(hint.contains("its terminal or supervisor"), "{hint}");
+        assert!(!hint.contains("bsk daemon restart"), "{hint}");
     }
 
     #[test]
@@ -783,7 +813,7 @@ mod m2_tests {
                 recovery: Some(Recovery::Unchanged),
                 ..failed.clone()
             }),
-            Some("0.4.0"),
+            Some(("0.4.0", false)),
             "0.4.0",
             &[],
             1_120,
@@ -821,7 +851,13 @@ mod m2_tests {
             host.detail
                 .contains("belongs to its terminal or supervisor")
         );
-        assert!(host.hint.unwrap().contains("--no-restart-daemon"));
+        let hint = host.hint.unwrap();
+        assert!(
+            hint.contains(
+                "run `bsk update`, then restart the daemon in its terminal or supervisor"
+            ),
+            "{hint}"
+        );
 
         skipped.skip_reason = Some(SkipReason::NotWritable);
         skipped.error = Some("permission denied".into());
@@ -856,6 +892,7 @@ mod m2_tests {
         let state = DaemonState::Verified {
             status: fake_status(Vec::new(), Vec::new()),
             local_identity_error: Some("peer identity is unavailable".into()),
+            host_managed: false,
         };
         let running = check_daemon_running(&state);
         let management = check_daemon_management(&state);

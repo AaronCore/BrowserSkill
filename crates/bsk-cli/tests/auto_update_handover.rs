@@ -212,6 +212,41 @@ impl Fixture {
         pid
     }
 
+    /// Start a daemon owned by this test, as a terminal or supervisor would.
+    fn start_foreground_daemon(&self, port: u16) -> u32 {
+        let child = self
+            .command()
+            .args([
+                "daemon",
+                "start",
+                "--foreground",
+                "--port",
+                &port.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        *self.daemon.borrow_mut() = Some(child);
+        pid
+    }
+
+    /// `bsk --json update --yes`, returning its report.
+    fn update(&self) -> serde_json::Value {
+        let out = self
+            .command()
+            .args(["--json", "update", "--yes"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
     fn daemon_exited(&self) -> bool {
         self.daemon
             .borrow_mut()
@@ -424,6 +459,66 @@ fn a_failed_handover_restores_the_previous_executable_and_keeps_serving() {
             .iter()
             .all(|name| !name.contains(".new-"))
     });
+}
+
+#[test]
+fn manual_update_leaves_a_host_managed_daemon_to_its_owner() {
+    let fixture = Fixture::new(marked_bsk);
+    let port = unused_port();
+    let pid = fixture.start_foreground_daemon(port);
+    fixture.wait_for("the foreground daemon", || {
+        fixture
+            .info()
+            .is_some_and(|info| info["pid"] == pid && info["host_managed"] == true)
+    });
+
+    let report = fixture.update();
+
+    assert_eq!(report["status"], "updated", "{report}");
+    assert_eq!(report["daemon"], "left_to_host", "{report}");
+    assert!(
+        report["message"]
+            .as_str()
+            .unwrap()
+            .contains("restart it there"),
+        "{report}"
+    );
+    assert!(fixture.installed() == fixture.release);
+    assert!(!fixture.daemon_exited(), "the owner's daemon keeps running");
+    assert_eq!(fixture.info().unwrap()["pid"], pid);
+    fixture.status_succeeds();
+    assert_eq!(fixture.record().unwrap()["result"], "succeeded");
+}
+
+#[test]
+fn manual_update_restarts_a_background_daemon_on_its_port() {
+    let fixture = Fixture::new(marked_bsk);
+    let port = unused_port();
+    let start = fixture
+        .command()
+        .args(["daemon", "start", "--port", &port.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let old_pid = fixture.info().unwrap()["pid"].clone();
+
+    let report = fixture.update();
+
+    assert_eq!(report["daemon"], "restarted", "{report}");
+    assert!(fixture.installed() == fixture.release);
+    let info = fixture.info().unwrap();
+    assert_ne!(info["pid"], old_pid);
+    assert_eq!(info["ws_port"], port, "restarted on the port it served");
+    assert!(info.get("host_managed").is_none(), "{info}");
+    let record = fixture.record().unwrap();
+    assert_eq!(record["result"], "succeeded", "{record}");
+    assert_eq!(record["stage"], "restart", "{record}");
+    assert_eq!(record["daemon_pid"], info["pid"], "{record}");
+    fixture.status_succeeds();
 }
 
 #[test]

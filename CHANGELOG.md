@@ -27,7 +27,11 @@ Starting from 0.2.0, CLI / Extension / DSH Plugin share the same version number.
 
 - Daemons started with `--foreground` no longer install updates or replace
   themselves with a detached process, on any platform. They log a new version
-  once, and the CLI hint suggests `bsk update`.
+  once, and the CLI hint suggests `bsk update` followed by a restart in the
+  daemon's terminal or supervisor. `bsk update` leaves such a daemon running
+  instead of stopping it and starting a background daemon in its place
+  (`"daemon": "left_to_host"` in `--json` output).
+- `bsk update` restarts a background daemon on the port it served.
 - A daemon that cannot write next to its executable reports new releases
   instead of installing them, and the CLI hint points to the installer.
 - Each update attempt, including the stage and error of a failure, is kept in
