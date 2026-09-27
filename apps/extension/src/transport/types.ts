@@ -21,6 +21,12 @@ export type ErrorCode =
 
 /** Stable `RpcError.data.reason` values for CLI hint selection. */
 export type RpcErrorReason =
+  | "ui_lookup_failed"
+  | "task_unavailable"
+  | "target_unavailable"
+  | "task_stopping"
+  | "ui_deadline"
+  | "preview_busy"
   | "agent_window_scope"
   | "element_not_visible"
   | "input_not_ready"
@@ -54,6 +60,7 @@ export type RpcErrorReason =
   | "confirmation_ui_unavailable"
   | "borrow_outcome_unknown"
   | "screenshot_capture_failed"
+  | "renderer_read_timeout"
   | "user_cancelled"
   | "page_hidden"
   | "navigation"
@@ -780,7 +787,7 @@ export type HelpOutcome =
 
 export interface HelpCompletionCondition {
   url_contains?: string;
-  url_matches?: string;
+  url_matches?: string | null;
   selector_exists?: string;
   selector_missing?: string;
   text_exists?: string;
