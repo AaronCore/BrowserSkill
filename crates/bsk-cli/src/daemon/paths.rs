@@ -110,11 +110,6 @@ pub fn update_state_path() -> Result<PathBuf> {
     Ok(bsk_home()?.join("update-state.json"))
 }
 
-/// Held for the whole of one update attempt (`update.lock`).
-pub fn update_lock_path() -> Result<PathBuf> {
-    Ok(bsk_home()?.join("update.lock"))
-}
-
 /// Why a replacement daemon failed to start, for the daemon handing over to it.
 pub fn replacement_failure_path(pid: u32) -> Result<PathBuf> {
     Ok(bsk_home()?

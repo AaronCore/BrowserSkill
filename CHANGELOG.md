@@ -11,17 +11,25 @@ Starting from 0.2.0, CLI / Extension / DSH Plugin share the same version number.
 
 - A failed auto-update no longer leaves the browser disconnected
   ([#336](https://github.com/Tencent/BrowserSkill/issues/336)). The daemon
-  runs the new executable once before relying on it, starts a daemon from it,
-  and exits only after that daemon answers. If the new daemon exits or is not
-  ready within 20 seconds, the previous executable is put back and the running
-  daemon serves again on the same port; the release is retried after 6 hours.
+  checks that the new executable reports the release's version, starts a
+  daemon from it, and exits only after a daemon of that version serves the
+  same port. If the new daemon exits or is not ready within 20 seconds, it is
+  stopped, the previous executable is put back and the running daemon serves
+  again on the same port; the release is retried after 6 hours. The update
+  record says a daemon is serving only once it has published `daemon.json`.
   This applies on all platforms.
 - Windows self-update no longer depends on a detached script: the running
   `bsk.exe` is renamed aside and the new one takes its place.
 - `bsk update` installs and checks the new executable before stopping the
-  daemon, and puts the previous executable back if the restarted daemon does
-  not become ready. It restarts the daemon from the installed path, which
-  Linux no longer reports as the current executable once it is replaced.
+  daemon. If the restarted daemon is not ready in time, it is stopped, the
+  previous executable is put back and the previous version restarted. It
+  restarts the daemon from the installed path, which Linux no longer reports
+  as the current executable once it is replaced.
+- A daemon keeps using the executable path it started from, so it can update
+  again after a rolled-back update on Linux.
+- Updates of one executable are serialized through a lock file next to it, so
+  daemons or `bsk update` runs with different bsk homes cannot overwrite each
+  other's installation or rollback.
 
 ### Changed
 

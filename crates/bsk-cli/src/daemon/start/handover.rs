@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 use super::DaemonChild;
 use crate::cli::update::Installed;
 use crate::cli::update::state::{Recovery, UpdateLock, UpdateRecord};
+use crate::daemon::info::DaemonInfo;
 use crate::daemon::lockfile::{self, DaemonLock};
 use crate::daemon::paths;
 use crate::daemon::probe::{self, PROBE_TIMEOUT, Probe};
@@ -35,6 +36,8 @@ const FAILURE_REPORT_LIMIT: usize = 4096;
 pub(crate) struct Pending {
     pub(super) child: DaemonChild,
     pub(super) child_pid: u32,
+    /// The WS port this daemon serves, which the replacement must serve too.
+    pub(super) port: u16,
     pub(super) installed: Installed,
     pub(super) record: UpdateRecord,
     pub(super) _update_lock: UpdateLock,
@@ -44,16 +47,47 @@ pub(super) enum Finished {
     /// Another daemon serves, or none can; this process exits.
     Exit,
     /// The handover failed and this process serves again under the lock.
-    Resume(DaemonLock),
+    /// `record` says so, and is confirmed once serving has resumed.
+    Resume {
+        lock: DaemonLock,
+        record: Box<UpdateRecord>,
+    },
+}
+
+/// The daemon a waiter accepts as serving.
+pub(crate) struct Expected<'a> {
+    /// The WS port browsers connect to; `None` accepts any.
+    pub(crate) port: Option<u16>,
+    pub(crate) version: &'a str,
+}
+
+/// What one status probe found, judged against [`Expected`].
+pub(super) enum Found {
+    Serving(DaemonInfo),
+    /// A daemon answers, but not the expected one.
+    Other(String),
+    Nothing,
 }
 
 /// Complete a handover once this process has stopped serving and released
 /// the daemon lock.
 pub(super) fn finish(mut pending: Pending) -> Finished {
-    match wait_for_replacement(&mut pending.child, pending.child_pid, HANDOVER_TIMEOUT) {
-        Ok((pid, version)) => {
-            info!(pid, %version, "replacement daemon is serving; exiting");
-            pending.record.succeed(Some((pid, version)));
+    let own_pid = std::process::id();
+    let target = pending.record.target_version.clone();
+    let expected = Expected {
+        port: Some(pending.port),
+        version: &target,
+    };
+    let waited = wait_until_serving(
+        &mut pending.child,
+        pending.child_pid,
+        HANDOVER_TIMEOUT,
+        || observe(Some(own_pid), &expected),
+    );
+    match waited {
+        Ok(daemon) => {
+            info!(pid = daemon.pid, version = %daemon.version, "replacement daemon is serving; exiting");
+            pending.record.succeed(Some((daemon.pid, daemon.version)));
             pending.installed.discard();
             Finished::Exit
         }
@@ -69,10 +103,13 @@ pub(super) fn finish(mut pending: Pending) -> Finished {
 
 /// Put the previous executable back and serve again. Restoring comes first,
 /// so a daemon another client starts meanwhile runs the previous version too.
+/// The record claims a serving daemon only for one that already serves the
+/// original port; a resumed one confirms it after publishing `daemon.json`.
 fn recover(pending: Pending, err: &anyhow::Error) -> Finished {
     let Pending {
         installed,
         mut record,
+        port,
         ..
     } = pending;
     let restored = installed.restore();
@@ -86,23 +123,28 @@ fn recover(pending: Pending, err: &anyhow::Error) -> Finished {
             None
         }
     };
-    let daemon_serving = lock.is_some() || serving_daemon(std::process::id()).is_some();
-    let recovery = match restored {
-        Ok(()) => Recovery::Restored { daemon_serving },
-        Err(_) => installed.restore_failed(),
-    };
-    record.fail(err, recovery);
+    let daemon_serving = lock.is_none() && serving_on(port);
+    record.fail(
+        err,
+        match restored {
+            Ok(()) => Recovery::Restored { daemon_serving },
+            Err(_) => installed.restore_failed(),
+        },
+    );
     match lock {
         Some(lock) => {
             info!("resuming service with the previous version");
-            Finished::Resume(lock)
+            Finished::Resume {
+                lock,
+                record: Box::new(record),
+            }
         }
         None if daemon_serving => {
-            info!("another daemon is serving; exiting");
+            info!("another daemon serves the port; exiting");
             Finished::Exit
         }
         None => {
-            error!("no daemon is serving after the failed handover; run `bsk daemon start`");
+            error!("no daemon serves the port after the failed handover; run `bsk daemon start`");
             Finished::Exit
         }
     }
@@ -119,39 +161,89 @@ pub(super) fn abandon(mut pending: Pending, reason: &str) {
     pending.record.fail(&err, recovery);
 }
 
-/// Wait until a daemon other than this process answers, failing as soon as
-/// the replacement exits or `timeout` passes. Returns the serving daemon's
-/// pid and version.
-pub(super) fn wait_for_replacement(
+/// Wait until `observe` finds the expected daemon serving, failing as soon as
+/// `child` exits or `timeout` passes; a child still running then is stopped
+/// and reaped, so it releases whatever it holds. Another client may start
+/// the expected daemon meanwhile, which counts; one that answers with another
+/// version or port does not, and is named in the error.
+pub(super) fn wait_until_serving(
     child: &mut DaemonChild,
     child_pid: u32,
     timeout: Duration,
-) -> Result<(u32, String)> {
-    let own_pid = std::process::id();
+    mut observe: impl FnMut() -> Found,
+) -> Result<DaemonInfo> {
     let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(serving) = serving_daemon(own_pid) {
-            return Ok(serving);
+    let mut other = None;
+    let mut look = |other: &mut Option<String>| match observe() {
+        Found::Serving(daemon) => Some(daemon),
+        Found::Other(found) => {
+            *other = Some(found);
+            None
         }
-        if let Some(status) = child.try_wait().context("check the replacement daemon")? {
-            // Another client may have started a daemon from the new binary.
-            if let Some(serving) = serving_daemon(own_pid) {
-                return Ok(serving);
+        Found::Nothing => None,
+    };
+    loop {
+        if let Some(daemon) = look(&mut other) {
+            return Ok(daemon);
+        }
+        if let Some(status) = child.try_wait().context("check the new daemon")? {
+            if let Some(daemon) = look(&mut other) {
+                return Ok(daemon);
             }
             anyhow::bail!(
-                "the replacement daemon (pid {child_pid}) exited with {status} before it was ready{}",
-                startup_failure(child_pid)
+                "the new daemon (pid {child_pid}) exited with {status} before it was ready{}{}",
+                startup_failure(child_pid),
+                describe_other(other.as_deref())
             );
         }
         if Instant::now() >= deadline {
             stop(child);
             anyhow::bail!(
-                "the replacement daemon (pid {child_pid}) was not ready within {timeout:?} and was stopped{}",
-                startup_failure(child_pid)
+                "the new daemon (pid {child_pid}) was not ready within {timeout:?} and was stopped{}{}",
+                startup_failure(child_pid),
+                describe_other(other.as_deref())
             );
         }
         std::thread::sleep(POLL);
     }
+}
+
+fn describe_other(other: Option<&str>) -> String {
+    other.map_or_else(String::new, |other| {
+        format!("; meanwhile a different daemon answered: {other}")
+    })
+}
+
+/// Probe the IPC endpoint once. `exclude` is a daemon that never counts,
+/// such as the one handing over.
+pub(super) fn observe(exclude: Option<u32>, expected: &Expected<'_>) -> Found {
+    match probe::probe(PROBE_TIMEOUT) {
+        Ok(Probe::Ready(daemon)) if Some(daemon.status.pid) != exclude => judge(
+            daemon.status.pid,
+            &daemon.status.daemon_version,
+            daemon.status.ws_port,
+            expected,
+        )
+        .map_or_else(Found::Other, |()| Found::Serving(daemon.info)),
+        _ => Found::Nothing,
+    }
+}
+
+/// Whether a daemon answering as `pid`, `version` on `port` is the expected
+/// one; if not, a description of what answered instead.
+fn judge(pid: u32, version: &str, port: u16, expected: &Expected<'_>) -> Result<(), String> {
+    let port_matches = expected.port.is_none_or(|expected| expected == port);
+    if version == expected.version && port_matches {
+        return Ok(());
+    }
+    Err(format!(
+        "pid {pid}, bsk {version} on port {port}, expected bsk {}{}",
+        expected.version,
+        expected
+            .port
+            .map(|port| format!(" on port {port}"))
+            .unwrap_or_default()
+    ))
 }
 
 /// A replacement that fails to start leaves the reason for its predecessor,
@@ -178,13 +270,13 @@ fn startup_failure(pid: u32) -> String {
     }
 }
 
-fn serving_daemon(own_pid: u32) -> Option<(u32, String)> {
-    match probe::probe(PROBE_TIMEOUT) {
-        Ok(Probe::Ready(daemon)) if daemon.status.pid != own_pid => {
-            Some((daemon.status.pid, daemon.status.daemon_version))
-        }
-        _ => None,
-    }
+/// Whether some daemon other than this process serves `port`.
+fn serving_on(port: u16) -> bool {
+    matches!(
+        probe::probe(PROBE_TIMEOUT),
+        Ok(Probe::Ready(daemon))
+            if daemon.status.pid != std::process::id() && daemon.status.ws_port == port
+    )
 }
 
 /// `None` when another process keeps the lock: either it serves already, or
@@ -195,7 +287,7 @@ fn reclaim_lock() -> Result<Option<DaemonLock>> {
         match lockfile::acquire() {
             Ok(lock) => return Ok(Some(lock)),
             Err(err) if err.is::<lockfile::AlreadyLocked>() => {
-                if Instant::now() >= deadline || serving_daemon(std::process::id()).is_some() {
+                if Instant::now() >= deadline {
                     return Ok(None);
                 }
                 std::thread::sleep(POLL);
@@ -210,6 +302,36 @@ fn stop(child: &mut DaemonChild) {
     let _ = child.wait();
 }
 
+#[cfg(test)]
+mod judge_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_expected_version_on_the_expected_port_counts() {
+        let expected = Expected {
+            port: Some(52719),
+            version: "999.0.0",
+        };
+        assert!(judge(7, "999.0.0", 52719, &expected).is_ok());
+        let other = judge(7, "0.3.1", 52720, &expected).unwrap_err();
+        assert_eq!(
+            other,
+            "pid 7, bsk 0.3.1 on port 52720, expected bsk 999.0.0 on port 52719"
+        );
+        assert!(
+            judge(7, "0.3.1", 52719, &expected).is_err(),
+            "wrong version"
+        );
+        assert!(judge(7, "999.0.0", 52800, &expected).is_err(), "wrong port");
+
+        let any_port = Expected {
+            port: None,
+            version: "999.0.0",
+        };
+        assert!(judge(7, "999.0.0", 40000, &any_port).is_ok());
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -220,6 +342,58 @@ mod tests {
             .args(["-c", script])
             .spawn()
             .unwrap()
+    }
+
+    fn serving(pid: u32) -> DaemonInfo {
+        DaemonInfo::now(pid, "sock".into(), 52719, "999.0.0")
+    }
+
+    #[test]
+    fn the_expected_daemon_counts_even_when_another_client_started_it() {
+        let mut child = spawn("sleep 30");
+        let pid = child.id();
+        let mut probes = 0;
+
+        let daemon = wait_until_serving(&mut child, pid, Duration::from_secs(10), || {
+            probes += 1;
+            if probes < 3 {
+                Found::Nothing
+            } else {
+                Found::Serving(serving(4242))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(daemon.pid, 4242);
+        stop(&mut child);
+    }
+
+    #[test]
+    fn a_different_daemon_answering_is_not_a_successful_handover() {
+        isolated(
+            concat!(
+                module_path!(),
+                "::a_different_daemon_answering_is_not_a_successful_handover"
+            ),
+            || {
+                let mut child = spawn("sleep 0.3; exit 1");
+                let pid = child.id();
+
+                let error = wait_until_serving(&mut child, pid, Duration::from_secs(10), || {
+                    Found::Other(
+                        "pid 9, bsk 0.3.1 on port 52720, expected bsk 999.0.0 on port 52719".into(),
+                    )
+                })
+                .unwrap_err();
+
+                let error = format!("{error:#}");
+                assert!(error.contains("exited with"), "{error}");
+                assert!(
+                    error.contains("a different daemon answered: pid 9, bsk 0.3.1 on port 52720"),
+                    "{error}"
+                );
+            },
+        );
     }
 
     #[test]
@@ -237,7 +411,8 @@ mod tests {
                 std::fs::write(&report, "bind WS server: address in use").unwrap();
 
                 let error =
-                    wait_for_replacement(&mut child, pid, Duration::from_secs(10)).unwrap_err();
+                    wait_until_serving(&mut child, pid, Duration::from_secs(10), || Found::Nothing)
+                        .unwrap_err();
 
                 let error = format!("{error:#}");
                 assert!(error.contains(&format!("pid {pid}")), "{error}");
@@ -261,8 +436,10 @@ mod tests {
                 let pid = child.id();
                 let started = Instant::now();
 
-                let error =
-                    wait_for_replacement(&mut child, pid, Duration::from_millis(300)).unwrap_err();
+                let error = wait_until_serving(&mut child, pid, Duration::from_millis(300), || {
+                    Found::Nothing
+                })
+                .unwrap_err();
 
                 assert!(started.elapsed() < Duration::from_secs(10));
                 let error = format!("{error:#}");

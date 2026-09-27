@@ -175,6 +175,40 @@ impl UpdateRecord {
         self.save();
     }
 
+    /// A failed attempt's previous version serves again: its daemon has bound
+    /// its endpoints and published `daemon.json`.
+    pub(crate) fn confirm_serving(&mut self) {
+        if self.mark_serving() {
+            self.save();
+        }
+    }
+
+    fn mark_serving(&mut self) -> bool {
+        let Some(Recovery::Restored { daemon_serving }) = &mut self.recovery else {
+            return false;
+        };
+        *daemon_serving = true;
+        self.updated_at_epoch_secs = now_epoch_secs();
+        true
+    }
+
+    /// A failed attempt's previous version could not serve again either.
+    pub(crate) fn serving_failed(&mut self, error: &anyhow::Error) {
+        self.note_serving_failure(error);
+        self.save();
+    }
+
+    fn note_serving_failure(&mut self, error: &anyhow::Error) {
+        let handover = self.error.take().unwrap_or_default();
+        self.error = Some(format!(
+            "{handover}; the previous version could not serve again: {error:#}"
+        ));
+        if let Some(Recovery::Restored { daemon_serving }) = &mut self.recovery {
+            *daemon_serving = false;
+        }
+        self.updated_at_epoch_secs = now_epoch_secs();
+    }
+
     /// When a daemon may next try `target`, if an earlier failure defers it.
     pub(crate) fn retry_blocked_until(&self, target: &Version, now: u64) -> Option<u64> {
         let retry_after = self.retry_after_epoch_secs?;
@@ -227,15 +261,15 @@ pub fn write(path: &Path, record: &UpdateRecord) -> Result<()> {
     super::write_json_atomically(path, record)
 }
 
-/// Serializes update attempts that share a bsk home, so an automatic and a
-/// manual update never swap the executable at the same time.
+/// Serializes update attempts on one installed executable, whichever bsk
+/// home they run for, from installation through confirmation or rollback.
+/// The lock file (`.<name>.update.lock`) stays next to the executable.
 #[derive(Debug)]
 pub(crate) struct UpdateLock(File);
 
 impl UpdateLock {
-    pub(crate) fn try_acquire() -> Result<Self> {
-        paths::ensure_bsk_home()?;
-        Self::try_acquire_at(&paths::update_lock_path()?)
+    pub(crate) fn try_acquire(target: &Path) -> Result<Self> {
+        Self::try_acquire_at(&super::sibling(target, "update.lock")?)
     }
 
     fn try_acquire_at(path: &Path) -> Result<Self> {
@@ -334,6 +368,24 @@ mod tests {
     }
 
     #[test]
+    fn the_lock_belongs_to_the_installation_not_the_bsk_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared = tmp.path().join("bin").join("bsk");
+        let other = tmp.path().join("other").join("bsk");
+        for exe in [&shared, &other] {
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        }
+        // Two daemons with different bsk homes update the same executable.
+        let first = UpdateLock::try_acquire(&shared).unwrap();
+        let error = UpdateLock::try_acquire(&shared).unwrap_err();
+        assert!(format!("{error:#}").contains("another bsk update is in progress"));
+        let _unrelated = UpdateLock::try_acquire(&other).unwrap();
+        drop(first);
+        UpdateLock::try_acquire(&shared).unwrap();
+        assert!(tmp.path().join("bin").join(".bsk.update.lock").exists());
+    }
+
+    #[test]
     fn only_one_update_attempt_holds_the_lock_at_a_time() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("update.lock");
@@ -357,6 +409,44 @@ mod tests {
             assert!(err.contains("another bsk update is in progress"), "{err}");
         }
         UpdateLock::try_acquire_at(&path).expect("released after the winner finishes");
+    }
+
+    #[test]
+    fn a_resumed_service_is_confirmed_or_its_failure_appended() {
+        let restored = |serving| UpdateRecord {
+            result: UpdateResult::Failed,
+            error: Some("replacement exited".into()),
+            recovery: Some(Recovery::Restored {
+                daemon_serving: serving,
+            }),
+            ..UpdateRecord::start(UpdateSource::Daemon, &TARGET, Path::new("bsk"))
+        };
+        let mut confirmed = restored(false);
+        assert!(confirmed.mark_serving());
+        assert_eq!(
+            confirmed.recovery,
+            Some(Recovery::Restored {
+                daemon_serving: true
+            })
+        );
+
+        let mut unchanged = UpdateRecord {
+            recovery: Some(Recovery::Unchanged),
+            ..restored(false)
+        };
+        assert!(!unchanged.mark_serving(), "only a restored daemon resumes");
+
+        let mut failed = restored(false);
+        failed.note_serving_failure(&anyhow::anyhow!("bind WS server: address in use"));
+        assert_eq!(
+            failed.recovery,
+            Some(Recovery::Restored {
+                daemon_serving: false
+            })
+        );
+        let error = failed.error.unwrap();
+        assert!(error.starts_with("replacement exited; "), "{error}");
+        assert!(error.contains("address in use"), "{error}");
     }
 
     #[test]

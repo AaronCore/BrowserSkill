@@ -1,10 +1,14 @@
 //! A detached daemon that auto-updates hands over to a daemon started from
-//! the new executable, and exits only once that daemon serves. When the new
-//! executable fails its self-check, or its daemon cannot start, the previous
-//! executable is put back and the running daemon keeps serving on its port.
+//! the new executable, and exits only once that daemon serves the release's
+//! version on its port. When the new executable fails its self-check, or its
+//! daemon cannot start, the previous executable is put back and the running
+//! daemon keeps serving on its port. `bsk update` restarts the daemon with the
+//! same guarantees.
 //!
 //! On Windows these tests need a host that permits Job breakaway; CI runs
 //! them from `scripts/test-windows-daemon.ps1`.
+
+mod release_fixture;
 
 use std::cell::RefCell;
 use std::fs;
@@ -22,7 +26,8 @@ use sha2::{Digest, Sha256};
 const EXE: &str = if cfg!(windows) { "bsk.exe" } else { "bsk" };
 const MARKER: &[u8] = b"auto-update-handover-fixture";
 
-/// Serves a manifest naming release 999.0.0 and an archive holding `binary`.
+/// Serves a manifest naming [`release_fixture::newer_version`] and an
+/// archive holding `binary`.
 struct ReleaseServer {
     url: String,
     downloads: Arc<AtomicUsize>,
@@ -46,9 +51,10 @@ impl ReleaseServer {
                 "sha256": Sha256::digest(&archive).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             }),
         );
-        let manifest =
-            serde_json::to_vec(&serde_json::json!({"version": "999.0.0", "assets": assets}))
-                .unwrap();
+        let manifest = serde_json::to_vec(
+            &serde_json::json!({"version": release_fixture::newer_version(), "assets": assets}),
+        )
+        .unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let downloads = Arc::new(AtomicUsize::new(0));
         let worker = {
@@ -281,13 +287,15 @@ impl Fixture {
         }
     }
 
-    /// Files next to the executable other than the executable itself.
+    /// Files next to the executable other than the executable itself and
+    /// the update lock, which stays.
     fn leftovers(&self) -> Vec<String> {
+        let lock = format!(".{EXE}.update.lock");
         fs::read_dir(self.exe.parent().unwrap())
             .unwrap()
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name != EXE)
+            .filter(|name| name != EXE && *name != lock)
             .collect()
     }
 
@@ -333,48 +341,65 @@ impl Drop for Fixture {
     }
 }
 
-/// The current bsk with a trailing marker: the same program, but a
-/// different file, so the tests can tell which one is installed.
-fn marked_bsk(_: &Path) -> Vec<u8> {
+/// The release: the bsk under test, reporting the newer version.
+fn newer_bsk(dir: &Path) -> Vec<u8> {
+    release_fixture::newer_bsk(dir)
+}
+
+/// The bsk under test with a trailing marker: a different file that still
+/// reports the current version, not the one its manifest names.
+fn mislabelled_bsk(_: &Path) -> Vec<u8> {
     let mut binary = fs::read(env!("CARGO_BIN_EXE_bsk")).unwrap();
     binary.extend_from_slice(MARKER);
     binary
 }
 
-/// Compile a stand-in for a broken release.
-fn compiled(dir: &Path, name: &str, main: &str) -> Vec<u8> {
-    let source = dir.join(format!("{name}.rs"));
-    fs::write(&source, format!("fn main() {{ {main} }}")).unwrap();
-    let output = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let status = Command::new(rustc)
-        .args(["--edition", "2021", "-o"])
-        .arg(&output)
-        .arg(&source)
-        .status()
-        .unwrap();
-    assert!(status.success(), "compile {name}");
-    fs::read(output).unwrap()
+/// Answers `--version` like the release; its daemon then runs `daemon`.
+fn stand_in(dir: &Path, name: &str, daemon: &str) -> Vec<u8> {
+    release_fixture::compiled(
+        dir,
+        name,
+        &format!(
+            r#"
+            if std::env::args().nth(1).as_deref() == Some("--version") {{
+                println!("bsk {}");
+                return;
+            }}
+            {daemon}
+            "#,
+            release_fixture::newer_version()
+        ),
+    )
 }
 
-/// Answers `--version` like bsk, but its daemon fails to start.
+/// Its daemon fails to start.
 fn release_whose_daemon_fails(dir: &Path) -> Vec<u8> {
-    compiled(
+    stand_in(dir, "daemon_fails", "std::process::exit(3);")
+}
+
+/// Its daemon takes the daemon lock, then never serves.
+fn release_whose_daemon_hangs(dir: &Path) -> Vec<u8> {
+    stand_in(
         dir,
-        "daemon_fails",
+        "daemon_hangs",
         r#"
-        if std::env::args().nth(1).as_deref() == Some("--version") {
-            println!("bsk 999.0.0");
-            return;
-        }
-        std::process::exit(3);
+        let home = std::env::var_os("BSK_HOME").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(std::path::Path::new(&home).join("daemon.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(600));
         "#,
     )
 }
 
 /// Cannot even report its version.
 fn release_that_cannot_run(dir: &Path) -> Vec<u8> {
-    compiled(dir, "cannot_run", "std::process::exit(1);")
+    release_fixture::compiled(dir, "cannot_run", "std::process::exit(1);")
 }
 
 fn unused_port() -> u16 {
@@ -387,7 +412,7 @@ fn unused_port() -> u16 {
 
 #[test]
 fn auto_update_exits_only_after_the_new_daemon_serves() {
-    let fixture = Fixture::new(marked_bsk);
+    let fixture = Fixture::new(newer_bsk);
     let port = unused_port();
     let old_pid = fixture.start_daemon(port);
 
@@ -403,7 +428,16 @@ fn auto_update_exits_only_after_the_new_daemon_serves() {
     assert_eq!(record["source"], "daemon", "{record}");
     assert_eq!(record["result"], "succeeded", "{record}");
     assert_eq!(record["stage"], "handover", "{record}");
-    assert_eq!(record["target_version"], "999.0.0", "{record}");
+    assert_eq!(
+        record["target_version"],
+        release_fixture::newer_version(),
+        "{record}"
+    );
+    assert_eq!(
+        record["daemon_version"],
+        release_fixture::newer_version(),
+        "{record}"
+    );
     assert_eq!(record["daemon_pid"], new_pid, "{record}");
     assert!(record.get("previous_executable").is_none(), "{record}");
     assert!(fixture.installed() == fixture.release);
@@ -433,14 +467,15 @@ fn a_failed_handover_restores_the_previous_executable_and_keeps_serving() {
             .info()
             .is_some_and(|info| info["pid"] == old_pid && info["ws_port"] == port)
     });
+    // Confirmed only once the resumed daemon has published daemon.json.
+    fixture.wait_for("the resumed service to be confirmed", || {
+        fixture.record().is_some_and(|record| {
+            record["recovery"] == serde_json::json!({"state": "restored", "daemon_serving": true})
+        })
+    });
 
     let record = fixture.record().unwrap();
     assert_eq!(record["stage"], "handover", "{record}");
-    assert_eq!(
-        record["recovery"],
-        serde_json::json!({"state": "restored", "daemon_serving": true}),
-        "{record}"
-    );
     let error = record["error"].as_str().unwrap();
     assert!(error.contains("before it was ready"), "{error}");
     assert!(record["retry_after_epoch_secs"].is_u64(), "{record}");
@@ -463,7 +498,7 @@ fn a_failed_handover_restores_the_previous_executable_and_keeps_serving() {
 
 #[test]
 fn manual_update_leaves_a_host_managed_daemon_to_its_owner() {
-    let fixture = Fixture::new(marked_bsk);
+    let fixture = Fixture::new(newer_bsk);
     let port = unused_port();
     let pid = fixture.start_foreground_daemon(port);
     fixture.wait_for("the foreground daemon", || {
@@ -492,7 +527,7 @@ fn manual_update_leaves_a_host_managed_daemon_to_its_owner() {
 
 #[test]
 fn manual_update_restarts_a_background_daemon_on_its_port() {
-    let fixture = Fixture::new(marked_bsk);
+    let fixture = Fixture::new(newer_bsk);
     let port = unused_port();
     let start = fixture
         .command()
@@ -522,33 +557,126 @@ fn manual_update_restarts_a_background_daemon_on_its_port() {
 }
 
 #[test]
-fn a_release_that_cannot_run_is_never_handed_over_to() {
-    let fixture = Fixture::new(release_that_cannot_run);
+fn a_release_that_cannot_run_or_reports_another_version_is_never_handed_over_to() {
+    for (release, expected_error) in [
+        (
+            release_that_cannot_run as fn(&Path) -> Vec<u8>,
+            "exited with",
+        ),
+        (
+            mislabelled_bsk,
+            concat!("printed \"bsk ", env!("CARGO_PKG_VERSION"), "\""),
+        ),
+    ] {
+        let fixture = Fixture::new(release);
+        let port = unused_port();
+        let old_pid = fixture.start_daemon(port);
+        fixture.wait_for("the daemon to serve", || {
+            fixture.info().is_some_and(|info| info["pid"] == old_pid)
+        });
+
+        fixture.wait_for("the failed update to be recorded", || {
+            fixture
+                .record()
+                .is_some_and(|record| record["result"] == "failed")
+        });
+
+        let record = fixture.record().unwrap();
+        assert_eq!(record["stage"], "install", "{record}");
+        assert_eq!(
+            record["recovery"],
+            serde_json::json!({"state": "unchanged"}),
+            "{record}"
+        );
+        let error = record["error"].as_str().unwrap();
+        assert!(error.contains("self-check"), "{error}");
+        assert!(error.contains(expected_error), "{error}");
+        assert!(fixture.installed() == fixture.original);
+        assert_eq!(fixture.info().unwrap()["pid"], old_pid, "never stopped");
+        assert!(!fixture.daemon_exited());
+        fixture.status_succeeds();
+    }
+}
+
+#[test]
+fn manual_update_stops_a_new_daemon_stuck_on_the_lock_and_restores_the_service() {
+    let fixture = Fixture::new(release_whose_daemon_hangs);
     let port = unused_port();
-    let old_pid = fixture.start_daemon(port);
-    fixture.wait_for("the daemon to serve", || {
-        fixture.info().is_some_and(|info| info["pid"] == old_pid)
-    });
+    let start = fixture
+        .command()
+        .args(["daemon", "start", "--port", &port.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
 
-    fixture.wait_for("the failed update to be recorded", || {
-        fixture
-            .record()
-            .is_some_and(|record| record["result"] == "failed")
-    });
+    let out = fixture
+        .command()
+        .args(["--json", "update", "--yes"])
+        .output()
+        .unwrap();
 
+    // `--json` reports the error on stdout.
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "the update must fail: {output}");
+    assert!(output.contains("rolled back"), "{output}");
+    assert!(fixture.installed() == fixture.original);
+    // The stuck daemon was stopped, so the previous version got the lock and
+    // serves the original port again.
+    let info = fixture.info().expect("a daemon serves again");
+    assert_eq!(info["ws_port"], port, "{info}");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"), "{info}");
+    fixture.status_succeeds();
     let record = fixture.record().unwrap();
-    assert_eq!(record["stage"], "install", "{record}");
+    assert_eq!(record["stage"], "restart", "{record}");
     assert_eq!(
         record["recovery"],
-        serde_json::json!({"state": "unchanged"}),
+        serde_json::json!({"state": "restored", "daemon_serving": true}),
         "{record}"
     );
-    assert!(
-        record["error"].as_str().unwrap().contains("self-check"),
+    let error = record["error"].as_str().unwrap();
+    assert!(error.contains("was not ready within"), "{error}");
+}
+
+#[test]
+fn a_resumed_daemon_that_cannot_serve_again_is_recorded_as_not_serving() {
+    let fixture = Fixture::new(release_whose_daemon_fails);
+    let port = unused_port();
+    fixture.start_daemon(port);
+    fixture.wait_for("the daemon to serve", || {
+        fixture.info().is_some_and(|info| info["ws_port"] == port)
+    });
+
+    // Take the port the moment the daemon releases it for the handover, so
+    // the previous version cannot bind it again after the replacement fails.
+    let listener = loop {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            break listener;
+        }
+        assert!(!fixture.daemon_exited(), "the daemon exited early");
+    };
+    fixture.wait_for("the daemon to give up", || fixture.daemon_exited());
+
+    let record = fixture.record().unwrap();
+    assert_eq!(record["result"], "failed", "{record}");
+    assert_eq!(
+        record["recovery"],
+        serde_json::json!({"state": "restored", "daemon_serving": false}),
         "{record}"
+    );
+    let error = record["error"].as_str().unwrap();
+    assert!(error.contains("before it was ready"), "{error}");
+    assert!(
+        error.contains("the previous version could not serve again"),
+        "{error}"
     );
     assert!(fixture.installed() == fixture.original);
-    assert_eq!(fixture.info().unwrap()["pid"], old_pid, "never stopped");
-    assert!(!fixture.daemon_exited());
-    fixture.status_succeeds();
+    drop(listener);
 }

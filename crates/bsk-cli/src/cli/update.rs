@@ -375,7 +375,7 @@ fn install_candidate_with_client(
     restart_daemon: bool,
     client: &reqwest::blocking::Client,
 ) -> Result<DaemonRestart> {
-    let target = std::env::current_exe().context("locate current bsk executable")?;
+    let target = installed_executable()?.to_path_buf();
     if let Err(err) = ensure_replaceable(&target) {
         UpdateRecord::skipped(
             UpdateSource::Command,
@@ -387,7 +387,7 @@ fn install_candidate_with_client(
         .save();
         return Err(err.context(installer_hint(&target)));
     }
-    let _lock = UpdateLock::try_acquire()?;
+    let _lock = UpdateLock::try_acquire(&target)?;
     let mut record = UpdateRecord::start(UpdateSource::Command, &candidate.latest, &target);
     record.save();
     let installed = install_verified(candidate, &target, client, &mut record)?;
@@ -424,10 +424,12 @@ fn install_candidate_with_client(
         port: running.map(|daemon| daemon.ws_port),
         ..StartArgs::default()
     };
-    // Start from `target`: once it is replaced, Linux no longer reports it as
-    // the current executable.
-    let start = || crate::daemon::start::start_detached(&target, &args);
-    match start() {
+    // The started process is ours to stop if it is not ready in time, so a
+    // restart of the previous version never meets a stuck one holding the
+    // daemon lock.
+    let start =
+        |version: &Version| crate::daemon::start::start_owned(&target, &args, &version.to_string());
+    match start(&candidate.latest) {
         Ok(daemon) => {
             record.succeed(Some((daemon.pid, daemon.version)));
             installed.discard();
@@ -436,7 +438,13 @@ fn install_candidate_with_client(
         Err(err) => {
             let err = err.context("restart the daemon from the new version");
             let recovery = installed.roll_back(|| Recovery::Restored {
-                daemon_serving: start().is_ok(),
+                daemon_serving: match start(&candidate.current) {
+                    Ok(_) => true,
+                    Err(restart) => {
+                        tracing::error!(error = %format_args!("{restart:#}"), "could not restart the previous version");
+                        false
+                    }
+                },
             });
             let restored = matches!(recovery, Recovery::Restored { .. });
             record.fail(&err, recovery);
@@ -498,7 +506,7 @@ pub(crate) fn install_verified(
     };
     record.previous_executable = Some(installed.previous.clone());
     record.save();
-    if let Err(err) = verify_executable(target) {
+    if let Err(err) = verify_executable(target, &candidate.latest) {
         let err = err.context("the new executable failed its self-check");
         record.fail(&err, installed.roll_back(|| Recovery::Unchanged));
         return Err(err);
@@ -1050,9 +1058,10 @@ pub(crate) fn ensure_replaceable(target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run the new executable once, so a binary that cannot start on this system
-/// is caught before any daemon depends on it.
-fn verify_executable(exe: &Path) -> Result<()> {
+/// Run the new executable once, so a binary that cannot start on this system,
+/// or is not the version the manifest names, is caught before any daemon
+/// depends on it.
+fn verify_executable(exe: &Path, version: &Version) -> Result<()> {
     let mut command = std::process::Command::new(exe);
     command
         .arg("--version")
@@ -1089,12 +1098,23 @@ fn verify_executable(exe: &Path) -> Result<()> {
         let _ = pipe.read_to_string(&mut stdout);
     }
     anyhow::ensure!(
-        status.success() && stdout.starts_with("bsk "),
-        "`{} --version` exited with {status} and printed {:?}",
+        status.success() && stdout.trim() == format!("bsk {version}"),
+        "`{} --version` exited with {status} and printed {:?}; expected \"bsk {version}\"",
         exe.display(),
         stdout.trim()
     );
     Ok(())
+}
+
+/// The executable this process was started from, captured on first use. On
+/// Linux `current_exe` names a replaced executable `<path> (deleted)` from then
+/// on, even after a rollback puts one back at the path, so a daemon captures it
+/// at startup and uses it for its whole life.
+pub(crate) fn installed_executable() -> Result<&'static Path> {
+    static EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| std::env::current_exe().ok())
+        .as_deref()
+        .context("locate current bsk executable")
 }
 
 /// Best-effort removal of what earlier updates left next to `exe`: previous
@@ -1451,18 +1471,92 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn self_check_requires_a_bsk_version_line() {
+    fn self_check_requires_the_manifest_version() {
         let tmp = tempfile::TempDir::new().unwrap();
-        verify_executable(&script(tmp.path(), "echo 'bsk 9.9.9'")).unwrap();
-        for body in ["echo 'bsk 9.9.9'; exit 3", "echo 'not bsk'", "exit 0"] {
-            let error = verify_executable(&script(tmp.path(), body)).unwrap_err();
-            assert!(
-                format!("{error:#}").contains("--version"),
-                "{body}: {error:#}"
-            );
+        let version = Version::new(9, 9, 9);
+        verify_executable(&script(tmp.path(), "echo 'bsk 9.9.9'"), &version).unwrap();
+        for body in [
+            "echo 'bsk 9.9.9'; exit 3",
+            "echo 'bsk 9.9.8'",
+            "echo 'bsk 9.9.9-rc.1'",
+            "echo 'not bsk'",
+            "exit 0",
+        ] {
+            let error = verify_executable(&script(tmp.path(), body), &version).unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains("expected \"bsk 9.9.9\""), "{body}: {error}");
         }
-        let error = verify_executable(&tmp.path().join("missing")).unwrap_err();
+        let error = verify_executable(&tmp.path().join("missing"), &version).unwrap_err();
         assert!(format!("{error:#}").contains("missing"), "{error:#}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "subprocess entry point"]
+    fn rolled_back_process() {
+        // Captured before the parent replaces this executable, as a daemon
+        // does at startup.
+        let captured = installed_executable().unwrap().to_path_buf();
+        let dir = PathBuf::from(std::env::var_os("BSK_TEST_DIR").unwrap());
+        std::fs::write(dir.join("ready"), "").unwrap();
+        while !dir.join("go").exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let current = std::env::current_exe().unwrap();
+        let installed = install_binary(&captured, b"second release");
+        std::fs::write(
+            dir.join("result"),
+            format!(
+                "{}\n{}\n{}",
+                current.display(),
+                captured.display(),
+                installed.map_or_else(|err| format!("{err:#}"), |_| "installed".into())
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rolled_back_process_can_install_again() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("bsk");
+        std::fs::copy(std::env::current_exe().unwrap(), &target).unwrap();
+        let original = std::fs::read(&target).unwrap();
+        let mut child = std::process::Command::new(&target)
+            .args([
+                "--exact",
+                "cli::update::tests::rolled_back_process",
+                "--ignored",
+            ])
+            .env("BSK_TEST_DIR", tmp.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !tmp.path().join("ready").exists() {
+            assert!(Instant::now() < deadline, "helper did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // An update of the running process fails and is rolled back.
+        install_binary(&target, b"first release")
+            .unwrap()
+            .restore()
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        std::fs::write(tmp.path().join("go"), "").unwrap();
+        assert!(child.wait().unwrap().success());
+
+        let result = std::fs::read_to_string(tmp.path().join("result")).unwrap();
+        let lines: Vec<_> = result.lines().collect();
+        assert!(
+            lines[0].ends_with(" (deleted)"),
+            "Linux no longer names the rolled-back executable: {result}"
+        );
+        assert_eq!(lines[1], target.display().to_string(), "{result}");
+        assert_eq!(lines[2], "installed", "{result}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"second release");
     }
 
     #[test]

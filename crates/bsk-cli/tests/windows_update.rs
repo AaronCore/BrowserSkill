@@ -1,6 +1,8 @@
 //! Exercise self-update with a real executable and a local release server.
 #![cfg(windows)]
 
+mod release_fixture;
+
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -14,8 +16,6 @@ use std::time::{Duration, Instant};
 
 use bsk::daemon::info::DaemonInfo;
 use sha2::{Digest, Sha256};
-
-const MARKER: &[u8] = b"windows-update-regression-fixture";
 
 struct ReleaseServer {
     url: String,
@@ -40,7 +40,7 @@ impl ReleaseServer {
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let manifest = serde_json::to_vec(&serde_json::json!({
-            "version": "999.0.0",
+            "version": release_fixture::newer_version(),
             "assets": {"windows-x64": {
                 "url": format!("{url}/bsk.zip"),
                 "sha256": Sha256::digest(&archive).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
@@ -138,7 +138,7 @@ fn release_server_waits_for_delayed_and_fragmented_request_headers() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     let (_, body) = response.split_once("\r\n\r\n").unwrap();
     let manifest: serde_json::Value = serde_json::from_str(body).unwrap();
-    assert_eq!(manifest["version"], "999.0.0");
+    assert_eq!(manifest["version"], release_fixture::newer_version());
 }
 
 struct Fixture {
@@ -159,10 +159,8 @@ impl Fixture {
         let home = tmp.path().join("home");
         fs::create_dir(&home).unwrap();
         fs::copy(env!("CARGO_BIN_EXE_bsk"), &exe).unwrap();
-        // A PE overlay distinguishes the replacement without requiring a
-        // second build or changing the executable's behavior/version.
-        let mut binary = fs::read(&exe).unwrap();
-        binary.extend_from_slice(MARKER);
+        // The same program reporting a newer version, as a release must.
+        let binary = release_fixture::newer_bsk(tmp.path());
         let server = ReleaseServer::new(&binary);
         Self {
             _tmp: tmp,
@@ -223,13 +221,14 @@ impl Fixture {
         fs::read(&self.exe).is_ok_and(|binary| binary == self.binary)
     }
 
-    /// Files next to the executable other than the executable itself.
+    /// Files next to the executable other than the executable itself and
+    /// the update lock, which stays.
     fn leftovers(&self) -> Vec<String> {
         fs::read_dir(self.exe.parent().unwrap())
             .unwrap()
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name != "bsk.exe")
+            .filter(|name| name != "bsk.exe" && name != ".bsk.exe.update.lock")
             .collect()
     }
 }
