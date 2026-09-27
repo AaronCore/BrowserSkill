@@ -280,13 +280,6 @@ pub fn info_for_error(code: ErrorCode, data: Option<&serde_json::Value>) -> Rend
             ),
             ..base
         },
-        (_, "extension_reconnecting") => RenderInfo {
-            summary: "extension is reconnecting",
-            hint: Some(
-                "retry session start after the extension settles; do not repeat a click, key press, upload, or download",
-            ),
-            ..base
-        },
         (_, "extension_reconnected") => RenderInfo {
             summary: "extension reconnected",
             hint: Some(
@@ -978,12 +971,6 @@ mod tests {
         );
         assert_eq!(silent.summary, "extension is not responding");
         assert_eq!(silent.exit_code, 4);
-        let reconnecting = info_for_error(
-            ErrorCode::ProtocolError,
-            Some(&serde_json::json!({"reason":"extension_reconnecting"})),
-        );
-        assert_eq!(reconnecting.summary, "extension is reconnecting");
-        assert!(reconnecting.hint.unwrap().contains("do not repeat"));
         let reconnected = info_for_error(
             ErrorCode::ProtocolError,
             Some(&serde_json::json!({"reason":"extension_reconnected"})),

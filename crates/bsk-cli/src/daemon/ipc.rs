@@ -1067,7 +1067,6 @@ fn map_start_error(err: StartSessionError) -> RpcError {
         StartSessionError::CleanupFailed { .. } => ErrorCode::ProtocolError,
         StartSessionError::TransportClosed => ErrorCode::ProtocolError,
         StartSessionError::ExtensionUnresponsive => ErrorCode::Timeout,
-        StartSessionError::ExtensionReconnecting => ErrorCode::ProtocolError,
         StartSessionError::ExtensionError(inner) => inner.code,
     };
     let message = err.to_string();
@@ -1094,9 +1093,6 @@ fn map_start_error(err: StartSessionError) -> RpcError {
         StartSessionError::ExtensionError(inner) => inner.data.clone(),
         StartSessionError::ExtensionUnresponsive => {
             Some(serde_json::json!({ "reason": "extension_unresponsive" }))
-        }
-        StartSessionError::ExtensionReconnecting => {
-            Some(serde_json::json!({ "reason": "extension_reconnecting" }))
         }
         _ => None,
     };

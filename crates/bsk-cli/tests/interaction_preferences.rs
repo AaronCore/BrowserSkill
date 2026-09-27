@@ -123,12 +123,8 @@ async fn start_with_protocol(protocol: &str) -> (tempfile::TempDir, Child, Ws) {
         "protocol_version":protocol,
         "instance_id":"policy-test", "browser":{"name":"chrome", "version":"130"}, "label":"test"
     }}).to_string())).await.unwrap();
-    let text = loop {
-        match ws.next().await.unwrap().unwrap() {
-            Message::Text(text) => break text,
-            Message::Ping(_) | Message::Pong(_) => continue,
-            other => panic!("missing handshake, got {other:?}"),
-        }
+    let Message::Text(text) = ws.next().await.unwrap().unwrap() else {
+        panic!("missing handshake")
     };
     let handshake: ResponseFrame = serde_json::from_str(&text).unwrap();
     assert!(matches!(handshake.body, ResponseBody::Ok(_)));

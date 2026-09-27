@@ -402,8 +402,6 @@ pub enum StartSessionError {
     TransportClosed,
     #[error("extension is not responding")]
     ExtensionUnresponsive,
-    #[error("extension is reconnecting")]
-    ExtensionReconnecting,
 }
 
 impl StartSessionError {
@@ -419,7 +417,6 @@ impl StartSessionError {
             StartSessionError::CleanupFailed { .. } => "protocol_error",
             StartSessionError::TransportClosed => "protocol_error",
             StartSessionError::ExtensionUnresponsive => "timeout",
-            StartSessionError::ExtensionReconnecting => "protocol_error",
             StartSessionError::ExtensionError(err) => match err.code {
                 bsk_protocol::ErrorCode::Timeout => "timeout",
                 bsk_protocol::ErrorCode::Cancelled => "cancelled",
@@ -497,71 +494,11 @@ pub async fn start_session(
     .await
 }
 
+/// Starting a session creates a window, so the daemon never retries it on
+/// the caller's behalf: a reconnect that lands mid-start is reported as
+/// such and the agent decides whether to ask again.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_session_recoverable(
-    registry: &Arc<BrowserRegistry>,
-    sessions: &Arc<SessionRegistry>,
-    queues: &Arc<ToolQueueRegistry>,
-    requested: Option<&str>,
-    window: AgentWindowOptions,
-    connect_wait: Duration,
-    timeout_dur: Duration,
-    cancel: Option<AbortToken>,
-    preserve_cleanup: bool,
-) -> Result<Session, StartSessionError> {
-    match attempt_start_session(
-        registry,
-        sessions,
-        queues,
-        requested,
-        window,
-        connect_wait,
-        timeout_dur,
-        cancel.clone(),
-        preserve_cleanup,
-    )
-    .await
-    {
-        Err(err) if start_error_is_reconnected(&err) => {
-            match attempt_start_session(
-                registry,
-                sessions,
-                queues,
-                requested,
-                window,
-                connect_wait,
-                timeout_dur,
-                cancel,
-                preserve_cleanup,
-            )
-            .await
-            {
-                Err(err) if start_error_is_reconnected(&err) => {
-                    Err(StartSessionError::ExtensionReconnecting)
-                }
-                other => other,
-            }
-        }
-        other => other,
-    }
-}
-
-/// A newer socket took this instance id. Absence is a disconnect, not a reconnect.
-fn browser_was_replaced(registry: &BrowserRegistry, client: &BrowserClient) -> bool {
-    registry
-        .get(&client.id)
-        .is_some_and(|current| current.generation != client.generation)
-}
-
-fn start_error_is_reconnected(err: &StartSessionError) -> bool {
-    match err {
-        StartSessionError::ExtensionError(rpc) => super::browsers::is_extension_reconnected(rpc),
-        _ => false,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn attempt_start_session(
     registry: &Arc<BrowserRegistry>,
     sessions: &Arc<SessionRegistry>,
     queues: &Arc<ToolQueueRegistry>,
@@ -619,33 +556,26 @@ async fn attempt_start_session(
         method: bsk_protocol::Method::ToolSessionStart,
         params: Some(serde_json::to_value(&params).unwrap()),
     };
-    let waiter = {
-        let mut pending = client.pending.lock().unwrap();
-        pending.register(rpc_id.clone())
-    };
     if cancel.as_ref().is_some_and(AbortToken::is_cancelled) {
         sessions.cancel_reservation(&session_id);
-        client.pending.lock().unwrap().cancel(&rpc_id);
         return Err(StartSessionError::Cancelled);
     }
-    if browser_was_replaced(registry, &client) {
-        sessions.cancel_reservation(&session_id);
-        client.pending.lock().unwrap().cancel(&rpc_id);
-        return Err(StartSessionError::ExtensionError(
-            super::browsers::extension_reconnected_error(),
-        ));
-    }
-    if client.sink.send(Frame::Request(request)).is_err() {
-        sessions.cancel_reservation(&session_id);
-        client.pending.lock().unwrap().cancel(&rpc_id);
-        if browser_was_replaced(registry, &client) {
-            return Err(StartSessionError::ExtensionError(
-                super::browsers::extension_reconnected_error(),
-            ));
+    // Registering the waiter and sending share the socket's pending lock,
+    // so a browser that reconnects here either loses the race (the start
+    // is refused before anything is sent) or wins it (the waiter settles
+    // at once with the reconnect error) — never both.
+    let mut waiter = match client.dispatch(request) {
+        Ok(waiter) => waiter,
+        Err(err) => {
+            sessions.cancel_reservation(&session_id);
+            return Err(match err {
+                super::browsers::SendError::Terminated(cause) => {
+                    StartSessionError::ExtensionError(cause)
+                }
+                super::browsers::SendError::SinkClosed => StartSessionError::TransportClosed,
+            });
         }
-        return Err(StartSessionError::TransportClosed);
-    }
-    let mut waiter = waiter;
+    };
     enum StartWaitOutcome {
         Response(bsk_protocol::ResponseFrame),
         WaiterClosed,
@@ -699,7 +629,6 @@ async fn attempt_start_session(
             .await);
         }
         StartWaitOutcome::Timeout => {
-            let unresponsive = client.note_unresponsive_if_silent();
             let err = finish_aborted_start(
                 &client,
                 sessions,
@@ -710,10 +639,17 @@ async fn attempt_start_session(
                 preserve_cleanup,
             )
             .await;
-            if unresponsive {
-                return Err(StartSessionError::ExtensionUnresponsive);
-            }
-            return Err(err);
+            // Judge the connection only after cleanup: the extension may
+            // have answered while compensating. A cleanup failure carries
+            // the resources the caller still has to reclaim, so only a
+            // plain timeout may be restated as a connection diagnosis.
+            let unresponsive = client.note_unresponsive_if_silent();
+            return Err(match err {
+                StartSessionError::Timeout if unresponsive => {
+                    StartSessionError::ExtensionUnresponsive
+                }
+                other => other,
+            });
         }
     };
     let start_result = match response.body {
@@ -901,10 +837,6 @@ async fn rollback_extension_session(
     session_id: &SessionId,
 ) -> Result<(), String> {
     let rollback_id = next_rpc_id("sess-start-rollback");
-    let waiter = {
-        let mut pending = client.pending.lock().unwrap();
-        pending.register(rollback_id.clone())
-    };
     let request = RequestFrame {
         id: rollback_id.clone(),
         method: Method::ToolSessionStop,
@@ -915,10 +847,15 @@ async fn rollback_extension_session(
             .expect("serialize session_start rollback params"),
         ),
     };
-    if client.sink.send(Frame::Request(request)).is_err() {
-        client.pending.lock().unwrap().cancel(&rollback_id);
-        return Err("browser disconnected before rollback was queued".into());
-    }
+    let waiter = match client.dispatch(request) {
+        Ok(waiter) => waiter,
+        Err(super::browsers::SendError::Terminated(cause)) => {
+            return Err(format!("rollback was not queued: {}", cause.message));
+        }
+        Err(super::browsers::SendError::SinkClosed) => {
+            return Err("browser disconnected before rollback was queued".into());
+        }
+    };
     let response = match timeout(CANCEL_CLEANUP_TIMEOUT, waiter).await {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => return Err("browser disconnected during rollback".into()),
@@ -1074,149 +1011,273 @@ fn drop_session_local(
 }
 
 #[cfg(test)]
-mod reconnect_tests {
+mod link_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use bsk_protocol::{Frame, ResponseBody, ResponseFrame};
+    use bsk_protocol::tools::SessionStartResult;
+    use bsk_protocol::{
+        ErrorCode, Frame, Method, RequestFrame, ResponseBody, ResponseFrame, RpcError,
+    };
     use tokio::sync::mpsc;
 
     use super::super::browsers::{
-        self, BrowserClient, BrowserId, BrowserRegistry, BrowserSink, Pending,
+        self, BrowserClient, BrowserId, BrowserRegistry, BrowserSink, Liveness, Pending,
     };
     use super::super::queue::ToolQueueRegistry;
-    use super::{AgentWindowOptions, SessionRegistry, StartSessionError, start_session};
+    use super::{
+        AgentWindowOptions, Session, SessionRegistry, StartSessionError, start_session_recoverable,
+    };
 
-    fn client(id: &str) -> (Arc<BrowserClient>, mpsc::UnboundedReceiver<Frame>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let client = Arc::new(BrowserClient {
-            id: BrowserId(id.into()),
-            browser_name: "chrome".into(),
-            browser_version: "1".into(),
-            extension_version: "0.1.0".into(),
-            extension_protocol_version: "1.3".into(),
-            label: String::new(),
-            sink: BrowserSink { tx },
-            pending: std::sync::Mutex::new(Pending::default()),
-            generation: browsers::next_browser_generation(),
-            connected_at_ms: 0,
-            version_skew: false,
-            last_seen: std::sync::Mutex::new(std::time::Instant::now()),
-            heartbeat_seen: std::sync::atomic::AtomicBool::new(true),
-            unresponsive: std::sync::atomic::AtomicBool::new(false),
-        });
-        (client, rx)
+    struct Harness {
+        browsers: Arc<BrowserRegistry>,
+        sessions: Arc<SessionRegistry>,
+        queues: Arc<ToolQueueRegistry>,
     }
 
-    fn harness() -> (
-        Arc<BrowserRegistry>,
-        Arc<SessionRegistry>,
-        Arc<ToolQueueRegistry>,
-    ) {
-        let browsers = Arc::new(BrowserRegistry::new());
-        let sessions = Arc::new(SessionRegistry::new());
-        let queues = Arc::new(ToolQueueRegistry::new(
-            Arc::clone(&browsers),
-            Arc::clone(&sessions),
-        ));
-        (browsers, sessions, queues)
+    impl Harness {
+        fn new() -> Self {
+            let browsers = Arc::new(BrowserRegistry::new());
+            let sessions = Arc::new(SessionRegistry::new());
+            let queues = Arc::new(ToolQueueRegistry::new(
+                Arc::clone(&browsers),
+                Arc::clone(&sessions),
+            ));
+            Self {
+                browsers,
+                sessions,
+                queues,
+            }
+        }
+
+        fn connect(
+            &self,
+            liveness: Liveness,
+        ) -> (Arc<BrowserClient>, mpsc::UnboundedReceiver<Frame>) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let client = Arc::new(BrowserClient {
+                id: BrowserId("browser".into()),
+                browser_name: "chrome".into(),
+                browser_version: "1".into(),
+                extension_version: "0.1.0".into(),
+                extension_protocol_version: "1.3".into(),
+                label: String::new(),
+                sink: BrowserSink { tx },
+                pending: std::sync::Mutex::new(Pending::default()),
+                generation: browsers::next_browser_generation(),
+                connected_at_ms: 0,
+                version_skew: false,
+                liveness,
+            });
+            self.browsers.insert(Arc::clone(&client));
+            (client, rx)
+        }
+
+        fn start(
+            &self,
+            timeout: Duration,
+            preserve_cleanup: bool,
+        ) -> tokio::task::JoinHandle<Result<Session, StartSessionError>> {
+            let browsers = Arc::clone(&self.browsers);
+            let sessions = Arc::clone(&self.sessions);
+            let queues = Arc::clone(&self.queues);
+            tokio::spawn(async move {
+                start_session_recoverable(
+                    &browsers,
+                    &sessions,
+                    &queues,
+                    None,
+                    AgentWindowOptions {
+                        size: None,
+                        focused: Some(false),
+                    },
+                    Duration::ZERO,
+                    timeout,
+                    None,
+                    preserve_cleanup,
+                )
+                .await
+            })
+        }
     }
 
-    async fn request_id(rx: &mut mpsc::UnboundedReceiver<Frame>) -> String {
+    /// A heartbeat-capable extension that has been quiet for ten minutes.
+    fn silent() -> Liveness {
+        let liveness = Liveness::default();
+        liveness.mark_heartbeat_seen();
+        liveness.__backdate_for_tests(Duration::from_secs(600));
+        liveness
+    }
+
+    async fn next_request(rx: &mut mpsc::UnboundedReceiver<Frame>) -> RequestFrame {
         match tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
-            .expect("session start request")
-            .expect("request frame")
+            .expect("a frame should reach the socket")
+            .expect("socket open")
         {
-            Frame::Request(request) => request.id,
+            Frame::Request(request) => request,
             other => panic!("expected a request, got {other:?}"),
         }
     }
 
-    #[tokio::test]
-    async fn session_start_retries_once_on_the_replacement_connection() {
-        let (browsers, sessions, queues) = harness();
-        let (first, mut first_rx) = client("browser");
-        browsers.insert(Arc::clone(&first));
-        let browsers_task = Arc::clone(&browsers);
-        let sessions_task = Arc::clone(&sessions);
-        let queues_task = Arc::clone(&queues);
-        let pending = tokio::spawn(async move {
-            start_session(
-                &browsers_task,
-                &sessions_task,
-                &queues_task,
-                None,
-                AgentWindowOptions {
-                    size: None,
-                    focused: Some(false),
-                },
-                Duration::ZERO,
-                Duration::from_secs(2),
-                None,
-            )
-            .await
+    fn answer(client: &BrowserClient, request: &RequestFrame, body: ResponseBody) {
+        let delivered = client.pending.lock().unwrap().resolve(ResponseFrame {
+            id: request.id.clone(),
+            body,
         });
-        let _ = request_id(&mut first_rx).await;
-        let (second, mut second_rx) = client("browser");
-        browsers.insert(Arc::clone(&second));
-        let second_id = request_id(&mut second_rx).await;
-        assert!(
-            second.pending.lock().unwrap().resolve(ResponseFrame {
-                id: second_id,
-                body: ResponseBody::Ok(
-                    serde_json::to_value(bsk_protocol::tools::SessionStartResult {
-                        interaction: None,
-                        agent_window_id: Some(7),
-                    })
-                    .unwrap(),
-                ),
-            })
-        );
-        let session = pending.await.unwrap().expect("retried start succeeds");
-        assert_eq!(session.agent_window_id, Some(7));
-        assert_eq!(session.browser_id, second.id);
+        assert!(delivered, "{} should still be waiting", request.id);
+    }
+
+    async fn start_error(
+        start: tokio::task::JoinHandle<Result<Session, StartSessionError>>,
+    ) -> StartSessionError {
+        tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .expect("the start should settle without waiting out its deadline")
+            .expect("start task")
+            .expect_err("the start should fail")
     }
 
     #[tokio::test]
-    async fn session_start_stops_after_a_second_reconnect() {
-        let (browsers, sessions, queues) = harness();
-        let (first, mut first_rx) = client("browser");
-        browsers.insert(first);
-        let browsers_task = Arc::clone(&browsers);
-        let sessions_task = Arc::clone(&sessions);
-        let queues_task = Arc::clone(&queues);
-        let pending = tokio::spawn(async move {
-            start_session(
-                &browsers_task,
-                &sessions_task,
-                &queues_task,
-                None,
-                AgentWindowOptions {
-                    size: None,
-                    focused: Some(false),
-                },
-                Duration::ZERO,
-                Duration::from_secs(2),
-                None,
-            )
-            .await
-        });
-        let _ = request_id(&mut first_rx).await;
-        let (second, mut second_rx) = client("browser");
-        browsers.insert(Arc::clone(&second));
-        let _ = request_id(&mut second_rx).await;
-        let (_third, mut third_rx) = client("browser");
-        browsers.insert(_third);
-        let err = pending
-            .await
-            .unwrap()
-            .expect_err("a second reconnect is reported");
-        assert!(matches!(err, StartSessionError::ExtensionReconnecting));
-        let third_request = tokio::time::timeout(Duration::from_millis(150), third_rx.recv()).await;
-        assert!(
-            third_request.is_err(),
-            "session start must not keep retrying"
+    async fn a_reconnect_mid_start_is_reported_and_never_replayed() {
+        let harness = Harness::new();
+        let (_first, mut first_rx) = harness.connect(Liveness::default());
+        let start = harness.start(Duration::from_secs(30), false);
+        assert_eq!(
+            next_request(&mut first_rx).await.method,
+            Method::ToolSessionStart
         );
+
+        let (_second, mut second_rx) = harness.connect(Liveness::default());
+
+        match start_error(start).await {
+            StartSessionError::ExtensionError(err) => assert!(browsers::is_link_failure(&err)),
+            other => panic!("expected the reconnect to be reported, got {other:?}"),
+        }
+        assert!(
+            harness.sessions.is_empty(),
+            "the reservation must be released"
+        );
+        assert!(
+            second_rx.try_recv().is_err(),
+            "creating a window must never be replayed on the new socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_mid_start_releases_the_caller() {
+        let harness = Harness::new();
+        let (client, mut rx) = harness.connect(Liveness::default());
+        let start = harness.start(Duration::from_secs(30), false);
+        next_request(&mut rx).await;
+
+        client.pending.lock().unwrap().close();
+
+        assert!(matches!(
+            start_error(start).await,
+            StartSessionError::TransportClosed
+        ));
+        assert!(
+            harness.sessions.is_empty(),
+            "the reservation must be released"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_plain_timeout_is_reported_as_unresponsive() {
+        let harness = Harness::new();
+        let (client, mut rx) = harness.connect(silent());
+        let start = harness.start(Duration::from_millis(50), false);
+        let request = next_request(&mut rx).await;
+        assert_eq!(next_request(&mut rx).await.method, Method::Cancel);
+        answer(
+            &client,
+            &request,
+            ResponseBody::Err(RpcError {
+                code: ErrorCode::Cancelled,
+                message: "cancelled".into(),
+                data: None,
+            }),
+        );
+
+        assert!(matches!(
+            start_error(start).await,
+            StartSessionError::ExtensionUnresponsive
+        ));
+        assert!(client.is_unresponsive());
+    }
+
+    #[tokio::test]
+    async fn a_heartbeating_extension_keeps_the_plain_timeout() {
+        let harness = Harness::new();
+        let liveness = Liveness::default();
+        liveness.mark_heartbeat_seen();
+        let (client, mut rx) = harness.connect(liveness);
+        let start = harness.start(Duration::from_millis(50), false);
+        let request = next_request(&mut rx).await;
+        next_request(&mut rx).await;
+        answer(
+            &client,
+            &request,
+            ResponseBody::Err(RpcError {
+                code: ErrorCode::Cancelled,
+                message: "cancelled".into(),
+                data: None,
+            }),
+        );
+
+        assert!(matches!(
+            start_error(start).await,
+            StartSessionError::Timeout
+        ));
+        assert!(!client.is_unresponsive());
+    }
+
+    #[tokio::test]
+    async fn a_silent_timeout_keeps_the_cleanup_failure_and_its_window() {
+        let harness = Harness::new();
+        let (client, mut rx) = harness.connect(silent());
+        let start = harness.start(Duration::from_millis(50), true);
+        let request = next_request(&mut rx).await;
+        assert_eq!(next_request(&mut rx).await.method, Method::Cancel);
+
+        // The window was created after all, and closing it fails.
+        answer(
+            &client,
+            &request,
+            ResponseBody::Ok(
+                serde_json::to_value(SessionStartResult {
+                    interaction: None,
+                    agent_window_id: Some(9),
+                })
+                .unwrap(),
+            ),
+        );
+        let rollback = next_request(&mut rx).await;
+        assert_eq!(rollback.method, Method::ToolSessionStop);
+        answer(
+            &client,
+            &rollback,
+            ResponseBody::Err(RpcError {
+                code: ErrorCode::ProtocolError,
+                message: "window close failed".into(),
+                data: None,
+            }),
+        );
+
+        match start_error(start).await {
+            StartSessionError::CleanupFailed {
+                session_id,
+                agent_window_id,
+                ..
+            } => {
+                assert_eq!(agent_window_id, Some(9));
+                assert!(
+                    harness.sessions.get(&session_id).is_some(),
+                    "the session must stay registered so cleanup can be retried"
+                );
+            }
+            other => panic!("the cleanup failure must not be restated, got {other:?}"),
+        }
     }
 }

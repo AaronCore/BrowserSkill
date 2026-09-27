@@ -120,7 +120,7 @@
           "minimum": 0.0
         },
         "unresponsive": {
-          "description": "The socket is still registered, but a call outlived a heartbeat interval with no inbound frame. Cleared when any frame arrives.",
+          "description": "The socket is still registered, but a call failed after this heartbeat-capable extension missed two heartbeats. Cleared when any frame arrives.",
           "default": false,
           "type": "boolean"
         },

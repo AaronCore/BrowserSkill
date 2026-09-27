@@ -38,7 +38,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bsk_protocol::tools::DebugActivity;
-use bsk_protocol::{ErrorCode, Frame, Method, RequestFrame, ResponseBody, RpcError, RpcId};
+use bsk_protocol::{
+    ErrorCode, Frame, Method, RequestFrame, ResponseBody, ResponseFrame, RpcError, RpcId,
+};
 use rand::Rng;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -616,52 +618,50 @@ async fn forward_one(
             data: None,
         });
     };
+    // The browser is registered but has stopped answering; a call would
+    // only hang until its own deadline. Nothing has been sent yet, so this
+    // is the one place where "not executed" is certain.
     if client.is_unresponsive() {
         return Err(super::browsers::extension_unresponsive_error());
     }
     let rpc_id = next_rpc_id("tool");
-    let waiter = {
-        let mut pending = client.pending.lock().unwrap();
-        pending.register(rpc_id.clone())
-    };
-    let request = Frame::Request(RequestFrame {
+    let request = RequestFrame {
         id: rpc_id.clone(),
         method: job.method.clone(),
         params: Some(job.params.clone()),
-    });
-    // Promote the inflight entry to "forwarded" AND push the WS
-    // request frame to the sink inside the same critical section
-    // (review round 2 C1). The closure runs while the entry's inner
-    // lock is held, so a concurrent `cancel` either:
+    };
+    // Promote the inflight entry to "forwarded" AND hand the WS request
+    // frame to the socket inside the same critical section (review round 2
+    // C1). The closure runs while the entry's inner lock is held, so a
+    // concurrent `cancel` either:
     //   * acquires the lock first → `cancelled` is set → the closure
     //     never runs → no WS frame escapes the daemon;
     //   * acquires the lock AFTER this dispatch → snapshot is
     //     Some/Some → the cancel caller forwards a WS cancel frame,
     //     which is enqueued strictly behind the request we just
     //     pushed, preserving the "request-before-cancel" wire order.
+    // `BrowserClient::dispatch` closes the second half of the same
+    // question: it registers the waiter and pushes the frame under the
+    // socket's pending lock, so a reconnect cannot land between them.
+    let mut dispatched = None;
     let cancel_token = match job.inflight.as_ref() {
         Some(entry) => {
             let outcome =
                 entry.promote_to_forwarded_with(session.browser_id.clone(), rpc_id.clone(), || {
-                    client.sink.send(request).is_ok()
+                    let result = client.dispatch(request);
+                    let sent = result.is_ok();
+                    dispatched = Some(result);
+                    sent
                 });
             match outcome {
                 PromoteOutcome::Promoted => Some(entry.cancel_token()),
                 PromoteOutcome::Cancelled => {
-                    client.pending.lock().unwrap().cancel(&rpc_id);
                     return Err(cancelled_error(
                         Some(entry),
                         "tool dispatch cancelled before forwarding",
                     ));
                 }
-                PromoteOutcome::SendFailed => {
-                    client.pending.lock().unwrap().cancel(&rpc_id);
-                    return Err(RpcError {
-                        code: ErrorCode::ProtocolError,
-                        message: "browser sink closed before request was queued".into(),
-                        data: None,
-                    });
-                }
+                PromoteOutcome::SendFailed => return Err(not_dispatched_error(dispatched)),
             }
         }
         None => {
@@ -673,22 +673,21 @@ async fn forward_one(
                 .as_ref()
                 .is_some_and(AbortToken::is_cancelled)
             {
-                client.pending.lock().unwrap().cancel(&rpc_id);
                 return Err(cancelled_error(
                     None,
                     "session lifecycle cancelled before forwarding",
                 ));
             }
-            if client.sink.send(request).is_err() {
-                client.pending.lock().unwrap().cancel(&rpc_id);
-                return Err(RpcError {
-                    code: ErrorCode::ProtocolError,
-                    message: "browser sink closed before request was queued".into(),
-                    data: None,
-                });
+            dispatched = Some(client.dispatch(request));
+            if dispatched.as_ref().is_some_and(Result::is_err) {
+                return Err(not_dispatched_error(dispatched));
             }
             job.lifecycle_cancel.clone()
         }
+    };
+    let waiter = match dispatched {
+        Some(Ok(waiter)) => waiter,
+        other => return Err(not_dispatched_error(other)),
     };
     let forward_lifecycle_cancel = || {
         if job.lifecycle_cancel.is_none() {
@@ -728,7 +727,14 @@ async fn forward_one(
         deadline_cancel,
     )
     .await;
-    let response = match waited {
+    // Record what this call implies about the control plane before shaping
+    // its error. Health and business errors are decided separately: the
+    // mark is diagnostic, every arm below keeps its own contract.
+    let silent = matches!(
+        waited,
+        WaitOutcome::Timeout | WaitOutcome::CleanupTimeout | WaitOutcome::TimeoutCleanupFailed
+    ) && client.note_unresponsive_if_silent();
+    let response = match with_link_contract(&job.method, waited) {
         WaitOutcome::Response(resp) => resp,
         WaitOutcome::CancelledAfterResponse(resp) => {
             if matches!(job.method, Method::ToolSessionStop | Method::ToolTabBorrow)
@@ -917,7 +923,6 @@ async fn forward_one(
         }
         WaitOutcome::Timeout => {
             client.pending.lock().unwrap().cancel(&rpc_id);
-            let unresponsive = client.note_unresponsive_if_silent();
             if job.method == Method::ToolTabBorrow {
                 return Err(unknown_borrow_error(ErrorCode::Timeout));
             }
@@ -929,7 +934,9 @@ async fn forward_one(
                     false,
                 ));
             }
-            if unresponsive && !is_native_input(&job.method) {
+            // Only a method with nothing to report about side effects can
+            // trade its timeout for the connection diagnosis.
+            if silent && !is_native_input(&job.method) {
                 return Err(super::browsers::extension_unresponsive_error());
             }
             return Err(RpcError {
@@ -941,16 +948,41 @@ async fn forward_one(
     };
     match response.body {
         ResponseBody::Ok(v) => Ok(v),
-        ResponseBody::Err(err) => Err(link_error_for_method(&job.method, err)),
+        ResponseBody::Err(err) => Err(err),
     }
 }
 
-/// A replaced connection already failed this call. Keep the unknown-effect
-/// signal for input and transfers so a retry cannot repeat a side effect.
-fn link_error_for_method(method: &Method, err: RpcError) -> RpcError {
-    if !super::browsers::is_extension_reconnected(&err) {
-        return err;
+/// The daemon synthesises a link failure when the socket carrying an
+/// already-dispatched call is abandoned. It can surface from any wait
+/// stage — plain wait, cancel cleanup or deadline cleanup — so it is
+/// converted once, here, and every arm below then handles an error that
+/// already carries this method's effect contract.
+fn with_link_contract(method: &Method, waited: WaitOutcome) -> WaitOutcome {
+    fn settle(method: &Method, frame: ResponseFrame) -> ResponseFrame {
+        match frame.body {
+            ResponseBody::Err(err) if super::browsers::is_link_failure(&err) => ResponseFrame {
+                id: frame.id,
+                body: ResponseBody::Err(link_failure_error(method, err)),
+            },
+            body => ResponseFrame { id: frame.id, body },
+        }
     }
+    match waited {
+        WaitOutcome::Response(frame) => WaitOutcome::Response(settle(method, frame)),
+        WaitOutcome::CancelledAfterResponse(frame) => {
+            WaitOutcome::CancelledAfterResponse(settle(method, frame))
+        }
+        WaitOutcome::TimedOutAfterResponse(frame) => {
+            WaitOutcome::TimedOutAfterResponse(settle(method, frame))
+        }
+        other => other,
+    }
+}
+
+/// The request was already on the wire when the connection went away, so
+/// the extension may well have run it. Methods with a side effect keep
+/// their machine-readable "outcome unknown" contract; nothing is replayed.
+fn link_failure_error(method: &Method, err: RpcError) -> RpcError {
     if is_native_input(method) {
         return RpcError {
             code: err.code,
@@ -966,7 +998,25 @@ fn link_error_for_method(method: &Method, err: RpcError) -> RpcError {
             false,
         );
     }
+    if matches!(method, Method::ToolTabBorrow) {
+        return unknown_borrow_error(err.code);
+    }
     err
+}
+
+/// Nothing left the daemon, so this call certainly had no effect: report
+/// why without any unknown-outcome wording.
+fn not_dispatched_error(
+    dispatched: Option<Result<oneshot::Receiver<ResponseFrame>, super::browsers::SendError>>,
+) -> RpcError {
+    match dispatched {
+        Some(Err(super::browsers::SendError::Terminated(cause))) => cause,
+        _ => RpcError {
+            code: ErrorCode::ProtocolError,
+            message: "browser sink closed before request was queued".into(),
+            data: None,
+        },
+    }
 }
 
 fn is_native_input(method: &Method) -> bool {
@@ -1509,24 +1559,63 @@ mod link_error_tests {
         crate::daemon::browsers::extension_reconnected_error()
     }
 
+    fn settled(method: Method, stage: fn(ResponseFrame) -> WaitOutcome) -> RpcError {
+        let frame = ResponseFrame {
+            id: "rpc".into(),
+            body: ResponseBody::Err(reconnected()),
+        };
+        match with_link_contract(&method, stage(frame)) {
+            WaitOutcome::Response(frame)
+            | WaitOutcome::CancelledAfterResponse(frame)
+            | WaitOutcome::TimedOutAfterResponse(frame) => match frame.body {
+                ResponseBody::Err(err) => err,
+                other => panic!("expected an error, got {other:?}"),
+            },
+            _ => panic!("the wait stage must be preserved"),
+        }
+    }
+
     #[test]
-    fn reconnect_keeps_unknown_outcome_for_input_and_transfers() {
-        let click = link_error_for_method(&Method::ToolClick, reconnected());
-        assert_eq!(
-            click.message,
-            "extension reconnected; the previous session is no longer valid"
-        );
-        assert_eq!(click.data.unwrap()["reason"], "input_outcome_unknown");
+    fn a_dispatched_call_keeps_its_effect_contract_in_every_wait_stage() {
+        let stages: [fn(ResponseFrame) -> WaitOutcome; 3] = [
+            WaitOutcome::Response,
+            WaitOutcome::CancelledAfterResponse,
+            WaitOutcome::TimedOutAfterResponse,
+        ];
+        for stage in stages {
+            let click = settled(Method::ToolClick, stage);
+            assert_eq!(click.data.unwrap()["reason"], "input_outcome_unknown");
 
-        let upload = link_error_for_method(&Method::ToolUpload, reconnected());
-        assert_eq!(
-            upload.message,
-            "extension reconnected; file transfer outcome is unknown"
-        );
-        assert_eq!(upload.data.unwrap()["reason"], "transfer_outcome_unknown");
+            let upload = settled(Method::ToolUpload, stage);
+            let upload = upload.data.unwrap();
+            assert_eq!(upload["reason"], "transfer_outcome_unknown");
+            assert_eq!(upload["effect_state"], "unknown");
 
-        let observe = link_error_for_method(&Method::ToolSnapshot, reconnected());
-        assert_eq!(observe.data.unwrap()["reason"], "extension_reconnected");
+            let borrow = settled(Method::ToolTabBorrow, stage);
+            assert_eq!(borrow.data.unwrap()["reason"], "borrow_outcome_unknown");
+
+            let observe = settled(Method::ToolSnapshot, stage);
+            assert_eq!(observe.data.unwrap()["reason"], "extension_reconnected");
+        }
+    }
+
+    #[test]
+    fn an_extension_error_is_not_mistaken_for_a_link_failure() {
+        let frame = ResponseFrame {
+            id: "rpc".into(),
+            body: ResponseBody::Err(RpcError {
+                code: ErrorCode::Timeout,
+                message: "page did not settle".into(),
+                data: Some(serde_json::json!({ "reason": "navigation_timeout" })),
+            }),
+        };
+        match with_link_contract(&Method::ToolClick, WaitOutcome::Response(frame)) {
+            WaitOutcome::Response(ResponseFrame {
+                body: ResponseBody::Err(err),
+                ..
+            }) => assert_eq!(err.data.unwrap()["reason"], "navigation_timeout"),
+            _ => panic!("extension errors must pass through unchanged"),
+        }
     }
 }
 

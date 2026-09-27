@@ -72,12 +72,10 @@ pub async fn send_handshake(
         .await
         .unwrap();
 
-    let text = loop {
-        match ws.next().await.unwrap().unwrap() {
-            Message::Text(t) => break t,
-            Message::Ping(_) | Message::Pong(_) => continue,
-            other => panic!("expected text frame, got {other:?}"),
-        }
+    let msg = ws.next().await.unwrap().unwrap();
+    let text = match msg {
+        Message::Text(t) => t,
+        _ => panic!("expected text frame"),
     };
     let resp: ResponseFrame = serde_json::from_str(&text).unwrap();
     match resp.body {
@@ -175,12 +173,10 @@ async fn ws_kicks_non_handshake_first_frame() {
     ws.send(Message::Text(serde_json::to_string(&bad).unwrap()))
         .await
         .unwrap();
-    let text = loop {
-        match ws.next().await.unwrap().unwrap() {
-            Message::Text(t) => break t,
-            Message::Ping(_) | Message::Pong(_) => continue,
-            other => panic!("expected text frame, got {other:?}"),
-        }
+    let resp = ws.next().await.unwrap().unwrap();
+    let text = match resp {
+        Message::Text(t) => t,
+        other => panic!("expected text frame, got {other:?}"),
     };
     let resp: ResponseFrame = serde_json::from_str(&text).unwrap();
     match resp.body {
