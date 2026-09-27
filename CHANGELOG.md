@@ -9,11 +9,8 @@ Starting from 0.2.0, CLI / Extension / DSH Plugin share the same version number.
 
 ### Fixed
 
-- IPC protocol: an explicit `null` result (for example the daemon's
-  `serde_json::to_value(..).unwrap_or(Value::Null)` fallback) is now decoded as a
-  success body instead of being rejected as an ambiguous frame; the daemon no
-  longer silently degrades result serialisation failures to `null` and returns a
-  structured `protocol_error` instead
+- Protocol: preserve explicit `null` results when deserializing `ResponseFrame`,
+  restoring round-trip consistency while rejecting responses with both a result and an error.
 
 ## [0.3.0] - 2026-09-16
 

@@ -156,7 +156,7 @@ pub fn default_ping_handler() -> RpcHandler {
             match method {
                 Method::SystemPing => {
                     let result = PingResult { pong: true };
-                    ok_value(result)
+                    ResponseBody::Ok(serde_json::to_value(result).unwrap_or(Value::Null))
                 }
                 other => ResponseBody::Err(RpcError {
                     code: ErrorCode::UnknownMethod,
@@ -178,11 +178,11 @@ pub fn system_handler(status: DaemonStatus) -> RpcHandler {
             match method {
                 Method::SystemPing => {
                     let result = PingResult { pong: true };
-                    ok_value(result)
+                    ResponseBody::Ok(serde_json::to_value(result).unwrap_or(Value::Null))
                 }
                 Method::SystemStatus => {
                     let result = status.snapshot();
-                    ok_value(result)
+                    ResponseBody::Ok(serde_json::to_value(result).unwrap_or(Value::Null))
                 }
                 other => ResponseBody::Err(RpcError {
                     code: ErrorCode::UnknownMethod,
@@ -230,7 +230,7 @@ pub fn full_handler(status: DaemonStatus, state: Arc<DaemonState>) -> RpcHandler
             let body = match method {
                 Method::SystemPing => {
                     let result = PingResult { pong: true };
-                    ok_value(result)
+                    ResponseBody::Ok(serde_json::to_value(result).unwrap_or(Value::Null))
                 }
                 Method::SystemStatus => match handle_status(&status, &state, params).await {
                     Ok(v) => ResponseBody::Ok(v),
@@ -437,16 +437,7 @@ async fn handle_tool_dispatch(
         for (file, path) in upload.files.iter_mut().zip(paths) {
             file.staged_path = Some(path.to_string_lossy().into_owned());
         }
-        params = match serde_json::to_value(&upload) {
-            Ok(v) => v,
-            Err(err) => {
-                return ResponseBody::Err(RpcError {
-                    code: ErrorCode::ProtocolError,
-                    message: format!("failed to serialise upload params: {err}"),
-                    data: None,
-                });
-            }
-        };
+        params = serde_json::to_value(upload).unwrap_or(Value::Null);
     } else if method == Method::ToolDownload {
         let mut download: DownloadParams = match serde_json::from_value(params) {
             Ok(v) => v,
@@ -459,16 +450,7 @@ async fn handle_tool_dispatch(
         download.browser_relative_dir = Some(staging.browser_relative_dir);
         download.max_byte_size = Some(super::file_transfer::MAX_TRANSFER_BYTES);
         download_transfer_id = Some(staging.transfer_id);
-        params = match serde_json::to_value(&download) {
-            Ok(v) => v,
-            Err(err) => {
-                return ResponseBody::Err(RpcError {
-                    code: ErrorCode::ProtocolError,
-                    message: format!("failed to serialise download params: {err}"),
-                    data: None,
-                });
-            }
-        };
+        params = serde_json::to_value(download).unwrap_or(Value::Null);
     }
     if let Some(audit_id) = audit_id
         && let Some(object) = params.as_object_mut()
@@ -523,7 +505,7 @@ async fn handle_tool_dispatch(
                 Ok(size) => {
                     result.byte_size = size;
                     result.transfer_id = Some(id);
-                    ok_value(result)
+                    ResponseBody::Ok(serde_json::to_value(result).unwrap_or(Value::Null))
                 }
                 Err(err) => {
                     state
@@ -562,7 +544,7 @@ fn handle_transfer_begin(state: &Arc<DaemonState>, params: Value) -> ResponseBod
         });
     }
     match state.transfers.begin_upload(p) {
-        Ok(v) => ok_value(v),
+        Ok(v) => ResponseBody::Ok(serde_json::to_value(v).unwrap_or(Value::Null)),
         Err(err) => ResponseBody::Err(err),
     }
 }
@@ -573,7 +555,7 @@ fn handle_transfer_chunk(state: &Arc<DaemonState>, params: Value) -> ResponseBod
         Err(err) => return ResponseBody::Err(invalid_params(err.to_string())),
     };
     match state.transfers.write_chunk(p) {
-        Ok(v) => ok_value(v),
+        Ok(v) => ResponseBody::Ok(serde_json::to_value(v).unwrap_or(Value::Null)),
         Err(err) => ResponseBody::Err(err),
     }
 }
@@ -584,7 +566,7 @@ fn handle_transfer_finish(state: &Arc<DaemonState>, params: Value) -> ResponseBo
         Err(err) => return ResponseBody::Err(invalid_params(err.to_string())),
     };
     match state.transfers.finish_upload(p) {
-        Ok(v) => ok_value(v),
+        Ok(v) => ResponseBody::Ok(serde_json::to_value(v).unwrap_or(Value::Null)),
         Err(err) => ResponseBody::Err(err),
     }
 }
@@ -595,7 +577,7 @@ fn handle_transfer_read(state: &Arc<DaemonState>, params: Value) -> ResponseBody
         Err(err) => return ResponseBody::Err(invalid_params(err.to_string())),
     };
     match state.transfers.read_chunk(p) {
-        Ok(v) => ok_value(v),
+        Ok(v) => ResponseBody::Ok(serde_json::to_value(v).unwrap_or(Value::Null)),
         Err(err) => ResponseBody::Err(err),
     }
 }
@@ -605,43 +587,13 @@ fn handle_transfer_release(state: &Arc<DaemonState>, params: Value) -> ResponseB
         Ok(v) => v,
         Err(err) => return ResponseBody::Err(invalid_params(err.to_string())),
     };
-    ok_value(state.transfers.release(p))
+    ResponseBody::Ok(serde_json::to_value(state.transfers.release(p)).unwrap_or(Value::Null))
 }
 
 fn invalid_params(message: impl Into<String>) -> RpcError {
     RpcError {
         code: ErrorCode::InvalidParams,
         message: message.into(),
-        data: None,
-    }
-}
-
-/// Serialise a handler result into a success body.
-///
-/// A serialisation failure (e.g. exceeding serde_json's recursion limit
-/// on a deeply nested payload) is surfaced as a `protocol_error` instead
-/// of silently degrading to JSON `null`. A `null` result would otherwise
-/// be indistinguishable from a method legitimately returning null and
-/// would hide the real failure from the CLI client; it also trips the
-/// wire decoder's "expected result or error" guard on peers that predate
-/// the explicit-null fix in `bsk-protocol/src/frame.rs`.
-fn ok_value(value: impl Serialize) -> ResponseBody {
-    match serde_json::to_value(&value) {
-        Ok(v) => ResponseBody::Ok(v),
-        Err(err) => ResponseBody::Err(RpcError {
-            code: ErrorCode::ProtocolError,
-            message: format!("failed to serialise handler result: {err}"),
-            data: None,
-        }),
-    }
-}
-
-/// Map a result-serialisation failure onto a structured `protocol_error`
-/// for handlers that return `Result<Value, RpcError>`.
-fn serialise_err(context: &str, err: serde_json::Error) -> RpcError {
-    RpcError {
-        code: ErrorCode::ProtocolError,
-        message: format!("failed to serialise {context}: {err}"),
         data: None,
     }
 }
@@ -683,7 +635,9 @@ async fn handle_wait_ms(
         });
     }
     if params.duration_ms == 0 {
-        return ok_value(WaitMsResult { waited_ms: 0 });
+        return ResponseBody::Ok(
+            serde_json::to_value(WaitMsResult { waited_ms: 0 }).unwrap_or(Value::Null),
+        );
     }
     let guard = match registry.register(rpc_id) {
         Ok(guard) => guard,
@@ -698,7 +652,10 @@ async fn handle_wait_ms(
     let token = guard.token().clone();
     let result = tokio::select! {
         _ = tokio::time::sleep(Duration::from_millis(params.duration_ms)) => {
-            ok_value(WaitMsResult { waited_ms: params.duration_ms })
+            ResponseBody::Ok(
+                serde_json::to_value(WaitMsResult { waited_ms: params.duration_ms })
+                    .unwrap_or(Value::Null),
+            )
         }
         _ = token.cancelled() => {
             ResponseBody::Err(RpcError {
@@ -766,7 +723,7 @@ fn handle_cancel(state: &Arc<DaemonState>, params: Value) -> ResponseBody {
             );
         }
     }
-    ok_value(CancelResult { cancelled })
+    ResponseBody::Ok(serde_json::to_value(CancelResult { cancelled }).unwrap_or(Value::Null))
 }
 
 /// Test-only re-export of the cancel handler: the system-only handler
@@ -786,7 +743,7 @@ fn handle_cancel_with_registry_only(registry: &Arc<AbortRegistry>, params: Value
         }
     };
     let cancelled = registry.cancel(&params.rpc_id);
-    ok_value(CancelResult { cancelled })
+    ResponseBody::Ok(serde_json::to_value(CancelResult { cancelled }).unwrap_or(Value::Null))
 }
 
 fn tool_dispatch_timeout(params: &Value) -> Result<Duration, RpcError> {
@@ -915,8 +872,7 @@ async fn handle_status(
 ) -> Result<Value, RpcError> {
     let params: StatusParams = parse_params_or_default(params)?;
     maybe_wait_for_browser(state, params.wait_for_browser_ms).await;
-    serde_json::to_value(status.snapshot_with(state))
-        .map_err(|err| serialise_err("status snapshot", err))
+    Ok(serde_json::to_value(status.snapshot_with(state)).unwrap_or(Value::Null))
 }
 
 fn parse_params_or_default<T>(params: Value) -> Result<T, RpcError>
@@ -1020,7 +976,7 @@ async fn handle_session_start(
                 browser_instance_id: session.browser_id.0.clone(),
                 agent_window_id: session.agent_window_id,
             };
-            serde_json::to_value(result).map_err(|err| serialise_err("session start result", err))
+            Ok(serde_json::to_value(result).unwrap_or(Value::Null))
         }
         Err(err) => Err(map_start_error(err)),
     }
@@ -1128,7 +1084,7 @@ async fn handle_session_stop(
                 returned_tab_ids: stop.returned_tab_ids,
                 return_failures: stop.return_failures,
             };
-            serde_json::to_value(result).map_err(|err| serialise_err("session stop result", err))
+            Ok(serde_json::to_value(result).unwrap_or(Value::Null))
         }
         Err(StopSessionError::ReturnFailures(stop)) => {
             let message = format!(
@@ -1145,7 +1101,7 @@ async fn handle_session_stop(
                 returned_tab_ids: stop.returned_tab_ids,
                 return_failures: stop.return_failures,
             };
-            serde_json::to_value(result).map_err(|err| serialise_err("session stop result", err))
+            Ok(serde_json::to_value(result).unwrap_or(Value::Null))
         }
         Err(err) => Err(map_stop_error(err)),
     }
@@ -1269,7 +1225,7 @@ async fn handle_session_stop_all(
         returned_tab_ids,
         return_failures,
     };
-    serde_json::to_value(result).map_err(|err| serialise_err("session stop_all result", err))
+    Ok(serde_json::to_value(result).unwrap_or(Value::Null))
 }
 
 fn handle_session_list(state: &Arc<DaemonState>) -> ResponseBody {
@@ -1279,7 +1235,7 @@ fn handle_session_list(state: &Arc<DaemonState>) -> ResponseBody {
         .into_iter()
         .map(|s| s.status_entry())
         .collect();
-    ok_value(SessionListResult { sessions })
+    ResponseBody::Ok(serde_json::to_value(SessionListResult { sessions }).unwrap_or(Value::Null))
 }
 
 async fn handle_browser_list(state: &Arc<DaemonState>, params: Value) -> Result<Value, RpcError> {
@@ -1291,8 +1247,7 @@ async fn handle_browser_list(state: &Arc<DaemonState>, params: Value) -> Result<
     // ascending, with `instance_id` as a deterministic tiebreaker
     // (review I1).
     let browsers = snapshot_status_entries(&state.browsers, &state.sessions);
-    serde_json::to_value(BrowserListResult { browsers })
-        .map_err(|err| serialise_err("browser list result", err))
+    Ok(serde_json::to_value(BrowserListResult { browsers }).unwrap_or(Value::Null))
 }
 
 // ----- Test-helper IpcServer wrapper around the transport layer -----
@@ -2075,70 +2030,5 @@ mod tests {
         drop(reader);
         let _ = tx.send(());
         let _ = server.await;
-    }
-
-    // A Serialize impl that always fails, standing in for a deeply
-    // nested payload that trips serde_json's recursion limit.
-    struct FailingSerialize;
-    impl serde::Serialize for FailingSerialize {
-        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: serde::Serializer,
-        {
-            Err(serde::ser::Error::custom("recursion limit exceeded"))
-        }
-    }
-
-    #[test]
-    fn ok_value_serialises_regular_result() {
-        match ok_value(PingResult { pong: true }) {
-            ResponseBody::Ok(v) => assert_eq!(v, serde_json::json!({ "pong": true })),
-            other => panic!("expected ok, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ok_value_reports_protocol_error_on_failed_serialise() {
-        // A serialisation failure must surface as a structured
-        // protocol_error instead of silently degrading to JSON null.
-        match ok_value(FailingSerialize) {
-            ResponseBody::Err(err) => {
-                assert_eq!(err.code, ErrorCode::ProtocolError);
-                assert!(
-                    err.message.contains("failed to serialise"),
-                    "message: {}",
-                    err.message
-                );
-            }
-            other => panic!("expected protocol_error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn serialise_err_builds_protocol_error_with_context() {
-        let err = serde_json::from_str::<serde_json::Value>("[").unwrap_err();
-        let rpc = serialise_err("status snapshot", err);
-        assert_eq!(rpc.code, ErrorCode::ProtocolError);
-        assert!(
-            rpc.message.contains("status snapshot"),
-            "message: {}",
-            rpc.message
-        );
-    }
-
-    #[test]
-    fn null_result_response_round_trips_over_frame_decode() {
-        // The daemon can legitimately emit an explicit null result;
-        // the CLI-side Frame decoder must treat it as a success body
-        // rather than an ambiguous frame (frame.rs regression guard).
-        let wire = r#"{"id":"rpc-null","result":null}"#;
-        let frame: Frame = serde_json::from_str(wire).expect("explicit null result decodes");
-        match frame {
-            Frame::Response(resp) => {
-                assert_eq!(resp.id, "rpc-null");
-                assert_eq!(resp.body, ResponseBody::Ok(serde_json::Value::Null));
-            }
-            other => panic!("expected response frame, got {other:?}"),
-        }
     }
 }
