@@ -245,6 +245,146 @@ impl Drop for Fixture {
     }
 }
 
+/// A Job that forbids breakaway, like the one a sandboxed agent runs
+/// commands in.
+struct RestrictiveJob(std::os::windows::io::OwnedHandle);
+
+impl RestrictiveJob {
+    fn new() -> Self {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        // SAFETY: no name or inheritable security descriptor; this test owns it.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+        let job = unsafe { OwnedHandle::from_raw_handle(handle) };
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        assert_ne!(
+            unsafe {
+                SetInformationJobObject(
+                    job.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of_val(&limits) as u32,
+                )
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        Self(job)
+    }
+
+    fn assign(&self, child: &Child) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        assert_ne!(
+            unsafe { AssignProcessToJobObject(self.0.as_raw_handle(), child.as_raw_handle()) },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Runs `bsk --json update --yes` once its parent has put it in a Job, and
+/// writes the outcome to `BSK_GATED_OUTPUT`.
+#[test]
+#[ignore = "subprocess entry point"]
+fn gated_update_process() {
+    let mut go = String::new();
+    std::io::stdin().read_line(&mut go).unwrap();
+    let output = Command::new(std::env::var_os("BSK_GATED_EXE").unwrap())
+        .args(["--json", "update", "--yes"])
+        .stdin(Stdio::null())
+        .creation_flags(0x0800_0000)
+        .output()
+        .unwrap();
+    let result = serde_json::json!({
+        "code": output.status.code(),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr),
+    });
+    fs::write(
+        std::env::var_os("BSK_GATED_OUTPUT").unwrap(),
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn update_from_a_restrictive_job_leaves_a_background_daemon_running() {
+    let fixture = Fixture::new();
+    let port = unused_port();
+    let start = fixture
+        .command()
+        .args(["daemon", "start", "--port", &port.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let before = fixture.info().unwrap();
+    let job = RestrictiveJob::new();
+    let result_path = fixture._tmp.path().join("gated-update.json");
+
+    let mut gated = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "gated_update_process", "--ignored", "--quiet"])
+        .env("BSK_GATED_EXE", &fixture.exe)
+        .env("BSK_GATED_OUTPUT", &result_path)
+        .env("BSK_HOME", &fixture.home)
+        .env("BSK_UPDATE_MANIFEST_URL", &fixture.server.url)
+        .env("BSK_AUTO_UPDATE", "off")
+        .env("RUST_LOG", "info")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env_remove("BSK_DAEMONIZED")
+        .env_remove("BSK_DAEMON_REPLACES_PID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .unwrap();
+    job.assign(&gated);
+    gated.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    assert!(gated.wait().unwrap().success());
+
+    let result: serde_json::Value =
+        serde_json::from_slice(&fs::read(&result_path).unwrap()).unwrap();
+    assert_eq!(result["code"], 0, "{result}");
+    let report: serde_json::Value =
+        serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
+    assert_eq!(report["daemon"], "left_running", "{report}");
+    assert!(
+        report["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot start an independent daemon"),
+        "{report}"
+    );
+    assert!(fixture.updated(), "the release is installed");
+    // The daemon it could not have started again keeps serving.
+    let after = fixture.info().expect("the daemon keeps serving");
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(after.ws_port, port);
+    let status = fixture
+        .command()
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+}
+
 #[test]
 fn manual_update_replaces_the_running_executable_in_place() {
     let fixture = Fixture::new();

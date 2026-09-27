@@ -173,6 +173,23 @@ pub(crate) fn start_detached(exe: &Path, args: &StartArgs) -> Result<daemon_info
     start_background_at(exe, args, deadline)
 }
 
+/// Whether this process can start a daemon that outlives it, as
+/// [`start_owned`] does. On Windows a host Job that forbids breakaway
+/// prevents that; the check starts nothing that runs. Elsewhere a daemon can
+/// always detach into its own session.
+pub(crate) fn check_independent_start(exe: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows::check_breakaway(exe)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = exe;
+        Ok(())
+    }
+}
+
 /// Start a daemon from `exe` for `bsk update`, and wait until a daemon of
 /// `version` serves `args`' port. Unlike [`start_detached`], the process is
 /// this caller's: one that is not ready in time is stopped and reaped, so a
@@ -473,6 +490,43 @@ enum StopReason {
     Handover,
 }
 
+/// The auto-update a daemon is applying. Its blocking steps store each result
+/// here themselves, rather than returning it to the async update task, which
+/// shutdown aborts; so [`serve`] always finds an unfinished update once the
+/// runtime has waited for those steps, and hands it over or undoes it.
+enum Transaction {
+    /// Installed and checked; no replacement started yet.
+    Installed(Prepared),
+    /// A replacement has been started and waits for the daemon lock.
+    HandingOver(handover::Pending),
+}
+
+impl Transaction {
+    /// Undo an update this daemon stopped before handing over.
+    fn abandon(self) {
+        use crate::cli::update::state::Recovery;
+        let reason = "the daemon stopped before handing over";
+        match self {
+            Transaction::HandingOver(pending) => handover::abandon(pending, reason),
+            Transaction::Installed(Prepared {
+                installed,
+                mut record,
+            }) => {
+                let recovery = installed.roll_back(|| Recovery::Restored {
+                    daemon_serving: false,
+                });
+                record.fail(&anyhow::anyhow!("handover abandoned: {reason}"), recovery);
+            }
+        }
+    }
+}
+
+type TransactionSlot = Arc<Mutex<Option<Transaction>>>;
+
+fn lock_slot(slot: &TransactionSlot) -> std::sync::MutexGuard<'_, Option<Transaction>> {
+    slot.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 /// Bind IPC and WS, publish `daemon.json`, and serve until shutdown. Returns
 /// with every endpoint released except the daemon lock, which the caller holds.
 /// `resumed` records a failed handover whose previous version serves again
@@ -482,11 +536,14 @@ fn serve(cfg: &DaemonConfig, resumed: Option<&mut UpdateRecord>) -> Result<Stopp
         .enable_all()
         .build()
         .context("build tokio runtime")?;
-    let handover_slot = Arc::new(Mutex::new(None::<handover::Pending>));
+    let transaction: TransactionSlot = Arc::new(Mutex::new(None));
+    // Tells an update in progress not to start installing.
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cfg = cfg.clone();
 
     let reason = runtime.block_on({
-        let handover_slot = Arc::clone(&handover_slot);
+        let transaction = Arc::clone(&transaction);
+        let stopping = Arc::clone(&stopping);
         async move {
         #[cfg(unix)]
         let sock_path = paths::sock_path().context("resolve socket path")?;
@@ -518,7 +575,8 @@ fn serve(cfg: &DaemonConfig, resumed: Option<&mut UpdateRecord>) -> Result<Stopp
             Arc::clone(&state),
             ws_port,
             Arc::clone(&restart_notify),
-            Arc::clone(&handover_slot),
+            Arc::clone(&transaction),
+            Arc::clone(&stopping),
         );
 
         let info = daemon_info::DaemonInfo::now(
@@ -684,6 +742,7 @@ fn serve(cfg: &DaemonConfig, resumed: Option<&mut UpdateRecord>) -> Result<Stopp
                 StopReason::Handover
             }
         };
+        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let _ = ipc_shutdown_tx.send(());
         let _ = ipc_task.await;
@@ -700,21 +759,23 @@ fn serve(cfg: &DaemonConfig, resumed: Option<&mut UpdateRecord>) -> Result<Stopp
         let _ = std::fs::remove_file(&sock_path);
         Result::<StopReason>::Ok(reason)
         }
-    })?;
+    });
+    // Dropping the runtime waits for blocking update steps still running, so
+    // the slot now holds whatever they installed or started.
     drop(runtime);
+    let transaction = lock_slot(&transaction).take();
 
-    let pending = handover_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .take();
-    Ok(match (reason, pending) {
-        (StopReason::Handover, Some(pending)) => Stopped::HandOver(Box::new(pending)),
-        (StopReason::Signal | StopReason::Idle, Some(pending)) => {
-            handover::abandon(pending, "the daemon stopped before handing over");
-            Stopped::Shutdown
+    match (reason, transaction) {
+        (Ok(StopReason::Handover), Some(Transaction::HandingOver(pending))) => {
+            Ok(Stopped::HandOver(Box::new(pending)))
         }
-        (_, None) => Stopped::Shutdown,
-    })
+        (reason, transaction) => {
+            if let Some(transaction) = transaction {
+                transaction.abandon();
+            }
+            reason.map(|_| Stopped::Shutdown)
+        }
+    }
 }
 
 /// Remove files earlier updates left next to this executable. A predecessor
@@ -866,11 +927,12 @@ pub(crate) fn spawn_session_idle_reaper(state: Arc<DaemonState>) -> tokio::task:
 /// confirms the replacement serves before this process exits, or restores
 /// the previous executable and serves again. A failed attempt is retried
 /// after [`crate::cli::update::state::RETRY_AFTER_FAILURE`].
-pub(crate) fn spawn_update_check_task(
+fn spawn_update_check_task(
     state: Arc<DaemonState>,
     ws_port: u16,
     restart: Arc<tokio::sync::Notify>,
-    handover_slot: Arc<Mutex<Option<handover::Pending>>>,
+    transaction: TransactionSlot,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     use crate::cli::update;
 
@@ -930,6 +992,8 @@ pub(crate) fn spawn_update_check_task(
                 let cache_path = cache_path.clone();
                 let state = Arc::clone(&state);
                 let exe_path = exe_path.clone();
+                let transaction = Arc::clone(&transaction);
+                let stopping = Arc::clone(&stopping);
                 tokio::task::spawn_blocking(move || {
                     // Checked on every tick: permissions can change while
                     // the daemon runs.
@@ -958,7 +1022,14 @@ pub(crate) fn spawn_update_check_task(
                         active_sessions,
                         last_attempt.as_ref(),
                         update::now_epoch_secs(),
-                        |candidate| prepare_handover(candidate, exe_path.as_deref()),
+                        |candidate| {
+                            prepare_handover(
+                                candidate,
+                                exe_path.as_deref(),
+                                &transaction,
+                                &stopping,
+                            )
+                        },
                     )?;
                     anyhow::Ok((outcome, not_writable, last_attempt))
                 })
@@ -1037,7 +1108,10 @@ pub(crate) fn spawn_update_check_task(
                     retry_after_epoch_secs = until,
                     "auto-update of this version failed recently; see `bsk doctor`, or run `bsk update` to retry now"
                 ),
-                update::AutoUpdateOutcome::Installed { latest, installed } => {
+                update::AutoUpdateOutcome::Installed {
+                    latest,
+                    installed: (),
+                } => {
                     info!(
                         current = env!("CARGO_PKG_VERSION"),
                         %latest,
@@ -1045,23 +1119,17 @@ pub(crate) fn spawn_update_check_task(
                     );
                     let exe = exe_path.clone();
                     let config = state.config.clone();
+                    let transaction = Arc::clone(&transaction);
                     let started = tokio::task::spawn_blocking(move || {
-                        start_replacement(installed, exe.as_deref(), &config, ws_port)
+                        start_replacement(&transaction, exe.as_deref(), &config, ws_port)
                     })
                     .await;
                     match started {
-                        Ok(Some(pending)) => {
-                            info!(
-                                replacement = pending.child_pid,
-                                "replacement daemon started; handing over once it is ready"
-                            );
-                            *handover_slot
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner()) = Some(pending);
+                        Ok(true) => {
                             restart.notify_one();
                             return;
                         }
-                        Ok(None) => {}
+                        Ok(false) => {}
                         Err(err) => warn!(error = %err, "starting the replacement daemon panicked"),
                     }
                 }
@@ -1070,18 +1138,22 @@ pub(crate) fn spawn_update_check_task(
     })
 }
 
-/// Everything a daemon needs to hand over to the version it just installed.
+/// An installed update a daemon has yet to hand over to. Holds the update
+/// lock through [`crate::cli::update::Installed`].
 struct Prepared {
     installed: crate::cli::update::Installed,
     record: crate::cli::update::state::UpdateRecord,
-    lock: crate::cli::update::state::UpdateLock,
 }
 
-/// Install and self-check `candidate` under the update lock. Blocking.
+/// Install and self-check `candidate` under the update lock, leaving the
+/// result in `transaction`. Blocking. Installs nothing once the daemon
+/// started stopping; any later stop finds the result in `transaction`.
 fn prepare_handover(
     candidate: &crate::cli::update::UpdateCandidate,
     exe: Option<&Path>,
-) -> Result<Prepared> {
+    transaction: &TransactionSlot,
+    stopping: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
     use crate::cli::update::{
         self,
         state::{UpdateLock, UpdateRecord, UpdateSource},
@@ -1090,29 +1162,31 @@ fn prepare_handover(
     let lock = UpdateLock::try_acquire(exe)?;
     let mut record = UpdateRecord::start(UpdateSource::Daemon, &candidate.latest, exe);
     record.save();
-    let installed = update::self_install_candidate(candidate, exe, &mut record)?;
-    Ok(Prepared {
-        installed,
-        record,
-        lock,
-    })
+    let cancelled = || stopping.load(std::sync::atomic::Ordering::SeqCst);
+    let installed = update::self_install_candidate(candidate, exe, &mut record, lock, &cancelled)?;
+    *lock_slot(transaction) = Some(Transaction::Installed(Prepared { installed, record }));
+    Ok(())
 }
 
 /// Spawn the replacement daemon from the new executable, on the port this
-/// daemon serves. If it cannot even be started, restore the previous
-/// executable and keep serving. Blocking.
+/// daemon serves, and leave it in `transaction`. If it cannot even be
+/// started, restore the previous executable and keep serving. Returns
+/// whether a replacement waits for the lock. Blocking.
 fn start_replacement(
-    prepared: Prepared,
+    transaction: &TransactionSlot,
     exe: Option<&Path>,
     config: &DaemonConfig,
     ws_port: u16,
-) -> Option<handover::Pending> {
+) -> bool {
     use crate::cli::update::state::{Recovery, UpdateStage};
-    let Prepared {
+    let mut slot = lock_slot(transaction);
+    let Some(Transaction::Installed(Prepared {
         installed,
         mut record,
-        lock,
-    } = prepared;
+    })) = slot.take()
+    else {
+        return false;
+    };
     record.enter(UpdateStage::Handover);
     let spawned = exe
         .context("current executable unknown")
@@ -1122,14 +1196,21 @@ fn start_replacement(
         })
         .context("start the replacement daemon");
     match spawned {
-        Ok(child) => Some(handover::Pending {
-            child_pid: child.id(),
-            child,
-            port: ws_port,
-            installed,
-            record,
-            _update_lock: lock,
-        }),
+        Ok(child) => {
+            let child_pid = child.id();
+            info!(
+                replacement = child_pid,
+                "replacement daemon started; handing over once it is ready"
+            );
+            *slot = Some(Transaction::HandingOver(handover::Pending {
+                child_pid,
+                child,
+                port: ws_port,
+                installed,
+                record,
+            }));
+            true
+        }
         Err(err) => {
             warn!(
                 error = %format_args!("{err:#}"),
@@ -1139,7 +1220,7 @@ fn start_replacement(
                 daemon_serving: true,
             });
             record.fail(&err, recovery);
-            None
+            false
         }
     }
 }

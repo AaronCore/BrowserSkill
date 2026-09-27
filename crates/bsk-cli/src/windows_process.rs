@@ -68,6 +68,11 @@ impl Process {
         Ok(())
     }
 
+    /// Whether the process belongs to no Job, including outer ones.
+    pub(crate) fn outside_job(&self) -> io::Result<bool> {
+        Ok(!process_in_job(self.handle.as_raw_handle())?)
+    }
+
     /// Called only for a child created suspended. A nested Job may allow only
     /// partial breakaway, so successful CreateProcessW is not sufficient.
     pub(crate) fn resume_outside_job(&self) -> io::Result<()> {

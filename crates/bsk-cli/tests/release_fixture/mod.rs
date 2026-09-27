@@ -4,8 +4,25 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
+/// Builds once per test process: each fixture takes seconds on Windows.
+fn cached(key: &str, build: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
+    static BUILT: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+    let built = BUILT.get_or_init(Default::default);
+    if let Some(binary) = built.lock().unwrap().get(key) {
+        return binary.clone();
+    }
+    let binary = build();
+    built
+        .lock()
+        .unwrap()
+        .insert(key.to_string(), binary.clone());
+    binary
+}
 
 /// Newer than the bsk under test and of the same length: every digit becomes
 /// 9, so `0.3.1` becomes `9.9.9`.
@@ -22,6 +39,10 @@ pub fn newer_version() -> String {
 /// The bsk under test, reporting [`newer_version`]. On macOS the copy is
 /// signed again (ad hoc), since the kernel refuses modified signed code.
 pub fn newer_bsk(dir: &Path) -> Vec<u8> {
+    cached("newer bsk", || build_newer_bsk(dir))
+}
+
+fn build_newer_bsk(dir: &Path) -> Vec<u8> {
     let current = env!("CARGO_PKG_VERSION").as_bytes();
     let newer = newer_version();
     let original = fs::read(env!("CARGO_BIN_EXE_bsk")).unwrap();
@@ -61,6 +82,10 @@ fn resign(_dir: &Path, binary: Vec<u8>) -> Vec<u8> {
 
 /// Compile a stand-in for a broken release from the body of its `main`.
 pub fn compiled(dir: &Path, name: &str, main: &str) -> Vec<u8> {
+    cached(&format!("compiled {name}"), || compile(dir, name, main))
+}
+
+fn compile(dir: &Path, name: &str, main: &str) -> Vec<u8> {
     let source = dir.join(format!("{name}.rs"));
     fs::write(&source, format!("fn main() {{ {main} }}")).unwrap();
     let output = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));

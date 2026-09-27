@@ -36,7 +36,8 @@ struct ReleaseServer {
 }
 
 impl ReleaseServer {
-    fn new(binary: &[u8]) -> Self {
+    /// `archive_delay` holds back the archive, keeping a download in flight.
+    fn new(binary: &[u8], archive_delay: Duration) -> Self {
         let (archive, suffix) = archive(binary);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -85,6 +86,7 @@ impl ReleaseServer {
                     }
                     let body = if request.starts_with(archive_request.as_bytes()) {
                         downloads.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(archive_delay);
                         &archive
                     } else {
                         &manifest
@@ -155,6 +157,10 @@ struct Fixture {
 impl Fixture {
     /// An installation of the current bsk whose next release is `release`.
     fn new(release: impl FnOnce(&Path) -> Vec<u8>) -> Self {
+        Self::with_archive_delay(release, Duration::ZERO)
+    }
+
+    fn with_archive_delay(release: impl FnOnce(&Path) -> Vec<u8>, delay: Duration) -> Self {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("bin dir");
         fs::create_dir(&dir).unwrap();
@@ -163,7 +169,7 @@ impl Fixture {
         let home = tmp.path().join("home");
         fs::create_dir(&home).unwrap();
         let release = release(tmp.path());
-        let server = ReleaseServer::new(&release);
+        let server = ReleaseServer::new(&release, delay);
         Self {
             original: fs::read(&exe).unwrap(),
             _tmp: tmp,
@@ -197,6 +203,10 @@ impl Fixture {
     /// Start a daemon as `bsk` starts one in the background, so it installs
     /// updates itself, and return its pid. It checks for updates at once.
     fn start_daemon(&self, port: u16) -> u32 {
+        self.start_daemon_idling_after(port, "60s")
+    }
+
+    fn start_daemon_idling_after(&self, port: u16, idle: &str) -> u32 {
         let child = self
             .command()
             .env("BSK_AUTO_UPDATE", "on")
@@ -207,7 +217,7 @@ impl Fixture {
                 "--port",
                 &port.to_string(),
                 "--daemon-idle",
-                "60s",
+                idle,
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -402,6 +412,41 @@ fn release_that_cannot_run(dir: &Path) -> Vec<u8> {
     release_fixture::compiled(dir, "cannot_run", "std::process::exit(1);")
 }
 
+/// Passes the self-check only after 3 seconds; its daemon fails to start.
+fn release_with_a_slow_self_check(dir: &Path) -> Vec<u8> {
+    release_fixture::compiled(
+        dir,
+        "slow_self_check",
+        &format!(
+            r#"
+            if std::env::args().nth(1).as_deref() == Some("--version") {{
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                println!("bsk {}");
+                return;
+            }}
+            std::process::exit(3);
+            "#,
+            release_fixture::newer_version()
+        ),
+    )
+}
+
+/// Start a daemon from the installed executable, as the next command would.
+fn daemon_starts_again(fixture: &Fixture) {
+    let port = unused_port();
+    let start = fixture
+        .command()
+        .args(["daemon", "start", "--port", &port.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    fixture.status_succeeds();
+}
+
 fn unused_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -494,6 +539,54 @@ fn a_failed_handover_restores_the_previous_executable_and_keeps_serving() {
             .iter()
             .all(|name| !name.contains(".new-"))
     });
+}
+
+#[test]
+fn an_update_installed_after_the_daemon_went_idle_is_undone() {
+    // The daemon idles out while the new executable's self-check runs, so the
+    // install finishes after shutdown began and must be rolled back.
+    let fixture = Fixture::new(release_with_a_slow_self_check);
+    fixture.start_daemon_idling_after(unused_port(), "1s");
+
+    fixture.wait_for("the daemon to idle out", || fixture.daemon_exited());
+
+    let record = fixture.record().unwrap();
+    assert_eq!(record["result"], "failed", "{record}");
+    assert_eq!(
+        record["recovery"],
+        serde_json::json!({"state": "restored", "daemon_serving": false}),
+        "{record}"
+    );
+    let error = record["error"].as_str().unwrap();
+    assert!(error.contains("handover abandoned"), "{error}");
+    assert!(
+        fixture.installed() == fixture.original,
+        "the previous executable is back in place"
+    );
+    daemon_starts_again(&fixture);
+}
+
+#[test]
+fn a_download_still_in_flight_when_the_daemon_idles_out_installs_nothing() {
+    let fixture = Fixture::with_archive_delay(release_whose_daemon_fails, Duration::from_secs(4));
+    fixture.start_daemon_idling_after(unused_port(), "1s");
+
+    fixture.wait_for("the daemon to idle out", || fixture.daemon_exited());
+
+    let record = fixture.record().unwrap();
+    assert_eq!(record["result"], "failed", "{record}");
+    assert_eq!(
+        record["recovery"],
+        serde_json::json!({"state": "unchanged"}),
+        "{record}"
+    );
+    let error = record["error"].as_str().unwrap();
+    assert!(
+        error.contains("stopped before the update was installed"),
+        "{error}"
+    );
+    assert!(fixture.installed() == fixture.original);
+    daemon_starts_again(&fixture);
 }
 
 #[test]

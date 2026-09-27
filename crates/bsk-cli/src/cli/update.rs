@@ -80,15 +80,16 @@ struct UpdateReport {
     release_url: Option<String>,
     asset_url: Option<String>,
     install_action: Option<&'static str>,
-    /// What happened to a running daemon: `restarted`, `not_running`, or
-    /// `left_to_host` for one its terminal or supervisor must restart.
+    /// What happened to a running daemon: `restarted`, `not_running`,
+    /// `left_to_host` for one its terminal or supervisor must restart, or
+    /// `left_running` when this process could not start its replacement.
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon: Option<&'static str>,
     message: String,
 }
 
 /// What `bsk update` did with the daemon after installing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DaemonRestart {
     /// `--no-restart-daemon`: a running daemon was not looked at.
     NotRequested,
@@ -98,6 +99,12 @@ enum DaemonRestart {
     /// previous version until its owner restarts it.
     LeftToHost {
         pid: u32,
+    },
+    /// This process cannot start an independent daemon, so the running one
+    /// keeps the previous version until it is restarted from where it can.
+    LeftRunning {
+        pid: u32,
+        reason: String,
     },
 }
 
@@ -288,6 +295,13 @@ fn run(args: UpdateArgs, format: Format) -> Result<()> {
         candidate.current, candidate.latest
     );
     let (daemon, message) = match restart {
+        DaemonRestart::LeftRunning { pid, reason } => (
+            Some("left_running"),
+            format!(
+                "{updated}; the daemon (pid {pid}) keeps running {}, since this process cannot start an independent daemon ({reason}): run `bsk daemon restart` from a terminal outside this sandbox to use {}",
+                candidate.current, candidate.latest
+            ),
+        ),
         DaemonRestart::NotRequested => (None, updated),
         DaemonRestart::NotRunning => (Some("not_running"), updated),
         DaemonRestart::Restarted => (Some("restarted"), updated),
@@ -387,16 +401,29 @@ fn install_candidate_with_client(
         .save();
         return Err(err.context(installer_hint(&target)));
     }
-    let _lock = UpdateLock::try_acquire(&target)?;
+    let lock = UpdateLock::try_acquire(&target)?;
     let mut record = UpdateRecord::start(UpdateSource::Command, &candidate.latest, &target);
     record.save();
-    let installed = install_verified(candidate, &target, client, &mut record)?;
+    let installed = install_verified(candidate, &target, client, &mut record, lock, &|| false)?;
 
     let running = restart_daemon.then(running_daemon).flatten();
     if let Some(daemon) = running.as_ref().filter(|daemon| daemon.host_managed) {
         record.succeed(None);
         installed.discard();
         return Ok(DaemonRestart::LeftToHost { pid: daemon.pid });
+    }
+    // Stopping a daemon this process could not start again (inside a host
+    // Job that forbids breakaway) would leave none: check before stopping.
+    if let Some(daemon) = running.as_ref() {
+        if let Err(err) = crate::daemon::start::check_independent_start(&target) {
+            tracing::warn!(error = %format_args!("{err:#}"), "leaving the running daemon alone");
+            record.succeed(None);
+            installed.discard();
+            return Ok(DaemonRestart::LeftRunning {
+                pid: daemon.pid,
+                reason: format!("{err:#}"),
+            });
+        }
     }
     let daemon_was_running = match restart_daemon
         .then(crate::daemon::start::stop_if_running)
@@ -470,9 +497,11 @@ fn running_daemon() -> Option<crate::daemon::info::DaemonInfo> {
     }
 }
 
-/// Download, install and run the new executable once. On failure the previous
-/// executable is back in place (or `record` says how to put it back), and
-/// `record` holds the reason.
+/// Download, install and run the new executable once, under `lock`, which
+/// the returned [`Installed`] keeps until the update is confirmed or rolled
+/// back. On failure the previous executable is back in place (or `record`
+/// says how to put it back), and `record` holds the reason. Nothing is
+/// installed once `cancelled` returns true after the download.
 ///
 /// `target` must be captured *before* any replacement happens: on Linux
 /// `std::env::current_exe` starts returning a ` (deleted)`-suffixed path once
@@ -482,6 +511,8 @@ pub(crate) fn install_verified(
     target: &Path,
     client: &reqwest::blocking::Client,
     record: &mut UpdateRecord,
+    lock: UpdateLock,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Installed> {
     let binary = match download_candidate_binary(candidate, client) {
         Ok(binary) => binary,
@@ -490,8 +521,13 @@ pub(crate) fn install_verified(
             return Err(err);
         }
     };
+    if cancelled() {
+        let err = anyhow::anyhow!("the daemon stopped before the update was installed");
+        record.fail(&err, Recovery::Unchanged);
+        return Err(err);
+    }
     record.enter(UpdateStage::Install);
-    let installed = match install_binary(target, &binary) {
+    let installed = match install_binary(target, &binary, lock) {
         Ok(installed) => installed,
         Err(err) => {
             let recovery = match err.downcast_ref::<PreviousNotRestored>() {
@@ -519,9 +555,11 @@ pub(crate) fn self_install_candidate(
     candidate: &UpdateCandidate,
     target: &Path,
     record: &mut UpdateRecord,
+    lock: UpdateLock,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Installed> {
     let client = update_http_client(ARCHIVE_FETCH_TIMEOUT)?;
-    install_verified(candidate, target, &client, record)
+    install_verified(candidate, target, &client, record, lock, cancelled)
 }
 
 /// Where to turn when bsk cannot write next to its own executable.
@@ -913,10 +951,12 @@ pub fn extract_bsk_binary(archive_bytes: &[u8], kind: ArchiveKind) -> Result<Vec
 
 /// A new executable at `target`. The previous one stays next to it until the
 /// new version is confirmed, so a failed handover or restart can put it back.
+/// The update lock is held for as long as this exists.
 #[derive(Debug)]
 pub(crate) struct Installed {
     target: PathBuf,
     previous: PathBuf,
+    _lock: UpdateLock,
 }
 
 impl Installed {
@@ -994,7 +1034,8 @@ impl PreviousNotRestored {
 
 /// Put `binary` at `target`, even while `target` is running: running
 /// processes keep their image and every later launch uses the new binary.
-fn install_binary(target: &Path, binary: &[u8]) -> Result<Installed> {
+/// The swap is not safe against a concurrent one, hence the lock it takes.
+fn install_binary(target: &Path, binary: &[u8], lock: UpdateLock) -> Result<Installed> {
     #[cfg(windows)]
     let previous = windows::replace(target, binary)?;
 
@@ -1004,6 +1045,7 @@ fn install_binary(target: &Path, binary: &[u8]) -> Result<Installed> {
     Ok(Installed {
         target: target.to_path_buf(),
         previous,
+        _lock: lock,
     })
 }
 
@@ -1371,10 +1413,58 @@ mod tests {
         assert_eq!(extracted, b"windows binary");
     }
 
+    fn locked(target: &Path) -> UpdateLock {
+        UpdateLock::try_acquire(target).unwrap()
+    }
+
+    #[test]
+    fn concurrent_updates_of_one_executable_take_turns_and_leave_it_intact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("bsk");
+        std::fs::write(&target, b"old binary").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let binaries: Vec<Vec<u8>> = (0..4).map(|i| format!("new binary {i}").into()).collect();
+        let attempts: Vec<_> = binaries
+            .iter()
+            .cloned()
+            .map(|binary| {
+                let target = target.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    // As production does: the lock first, then the swap.
+                    let lock =
+                        UpdateLock::try_acquire(&target).map_err(|err| format!("{err:#}"))?;
+                    let installed = install_binary(&target, &binary, lock)
+                        .map_err(|err| format!("swap failed: {err:#}"))?;
+                    // Hold the lock a while, as a handover would.
+                    std::thread::sleep(Duration::from_millis(100));
+                    installed.discard();
+                    Ok::<_, String>(binary)
+                })
+            })
+            .collect();
+        let results: Vec<_> = attempts.into_iter().map(|t| t.join().unwrap()).collect();
+
+        let installed: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert!(!installed.is_empty(), "{results:?}");
+        for refused in results.iter().filter_map(|r| r.as_ref().err()) {
+            assert!(
+                refused.contains("another bsk update is in progress"),
+                "{refused}"
+            );
+        }
+        let content = std::fs::read(&target).unwrap();
+        assert!(installed.contains(&&content), "{content:?}");
+        assert_eq!(dir_names(tmp.path()), ["bsk"], "no staged file is left");
+    }
+
+    /// Files in `dir`, except update lock files, which stay by design.
     fn dir_names(dir: &Path) -> Vec<String> {
         let mut names: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| !name.ends_with(".update.lock"))
             .collect();
         names.sort();
         names
@@ -1387,7 +1477,7 @@ mod tests {
         let target = tmp.path().join("bsk");
         std::fs::write(&target, b"old binary").unwrap();
 
-        let installed = install_binary(&target, b"new binary").unwrap();
+        let installed = install_binary(&target, b"new binary", locked(&target)).unwrap();
 
         assert_eq!(std::fs::read(&target).unwrap(), b"new binary");
         assert_eq!(std::fs::read(&installed.previous).unwrap(), b"old binary");
@@ -1409,7 +1499,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("bsk");
         std::fs::write(&target, b"old binary").unwrap();
-        let installed = install_binary(&target, b"new binary").unwrap();
+        let installed = install_binary(&target, b"new binary", locked(&target)).unwrap();
 
         assert_eq!(
             installed.roll_back(|| Recovery::Unchanged),
@@ -1503,7 +1593,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let current = std::env::current_exe().unwrap();
-        let installed = install_binary(&captured, b"second release");
+        let installed = install_binary(&captured, b"second release", locked(&captured));
         std::fs::write(
             dir.join("result"),
             format!(
@@ -1540,7 +1630,7 @@ mod tests {
         }
 
         // An update of the running process fails and is rolled back.
-        install_binary(&target, b"first release")
+        install_binary(&target, b"first release", locked(&target))
             .unwrap()
             .restore()
             .unwrap();

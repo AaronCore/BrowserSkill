@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use super::DaemonChild;
 use crate::cli::update::Installed;
-use crate::cli::update::state::{Recovery, UpdateLock, UpdateRecord};
+use crate::cli::update::state::{Recovery, UpdateRecord};
 use crate::daemon::info::DaemonInfo;
 use crate::daemon::lockfile::{self, DaemonLock};
 use crate::daemon::paths;
@@ -38,9 +38,9 @@ pub(crate) struct Pending {
     pub(super) child_pid: u32,
     /// The WS port this daemon serves, which the replacement must serve too.
     pub(super) port: u16,
+    /// Holds the update lock until the handover is confirmed or undone.
     pub(super) installed: Installed,
     pub(super) record: UpdateRecord,
-    pub(super) _update_lock: UpdateLock,
 }
 
 pub(super) enum Finished {

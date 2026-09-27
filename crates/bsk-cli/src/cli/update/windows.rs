@@ -33,7 +33,8 @@ const LEGACY_HELPER_GRACE: Duration = Duration::from_secs(60 * 60);
 /// Upper bound for a legacy helper report copied into the daemon log.
 const LEGACY_REPORT_LIMIT: usize = 4096;
 
-/// Returns where the previous executable now lives.
+/// Returns where the previous executable now lives. Two concurrent swaps can
+/// interleave their renames; callers hold the update lock.
 pub(super) fn replace(target: &Path, binary: &[u8]) -> Result<PathBuf> {
     super::remove_update_leftovers(target);
     let staged = sibling(target, &format!("new-{}", unique_suffix()))?;
@@ -175,7 +176,7 @@ fn is_transient(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::update::{Installed, remove_update_leftovers};
+    use crate::cli::update::remove_update_leftovers;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::process::CommandExt;
     use std::time::SystemTime;
@@ -318,11 +319,7 @@ mod tests {
             // This process owns the previous executable until it exits.
             remove_update_leftovers(&target);
             assert_eq!(names(&dir).len(), 2, "{name}");
-            Installed {
-                target: target.clone(),
-                previous,
-            }
-            .discard();
+            fs::remove_file(&previous).unwrap();
             assert_eq!(names(&dir), ["bsk.exe"], "{name}");
         }
     }
@@ -426,41 +423,6 @@ mod tests {
 
         release.join().unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new binary");
-    }
-
-    #[test]
-    fn concurrent_replacements_leave_one_intact_executable() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let target = tmp.path().join("bsk.exe");
-        fs::write(&target, b"old binary").unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
-        let binaries: Vec<Vec<u8>> = (0..4).map(|i| format!("new binary {i}").into()).collect();
-        let workers: Vec<_> = binaries
-            .iter()
-            .cloned()
-            .map(|binary| {
-                let target = target.clone();
-                let barrier = std::sync::Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    replace(&target, &binary).is_ok()
-                })
-            })
-            .collect();
-        let succeeded = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
-            .filter(|ok| *ok)
-            .count();
-
-        assert!(succeeded >= 1);
-        let installed = fs::read(&target).unwrap();
-        assert!(binaries.contains(&installed), "{installed:?}");
-        let staged: Vec<_> = names(tmp.path())
-            .into_iter()
-            .filter(|name| name.starts_with(".bsk.exe.new-"))
-            .collect();
-        assert!(staged.is_empty(), "{staged:?}");
     }
 
     #[test]

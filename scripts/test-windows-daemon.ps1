@@ -51,16 +51,21 @@ public static class DaemonTestHost {
                 $process.StartInfo.RedirectStandardError = $true
                 $exitCode = -1
                 $errorText = $null
+                $stdout = $null
+                $stderr = $null
+                $timedOut = $false
+                $suiteStart = Get-Date
                 $watch = [Diagnostics.Stopwatch]::StartNew()
                 try {
                     if (-not $process.Start()) { throw 'Test process did not start' }
                     $stdout = $process.StandardOutput.ReadToEndAsync()
                     $stderr = $process.StandardError.ReadToEndAsync()
-                    if (-not $process.WaitForExit(180000)) { throw 'Test process exceeded 180 seconds' }
+                    if (-not $process.WaitForExit($manifest.suiteSeconds * 1000)) {
+                        $timedOut = $true
+                        throw "Test process exceeded $($manifest.suiteSeconds) seconds"
+                    }
                     $exitCode = $process.ExitCode
                     if (-not $stdout.Wait(5000) -or -not $stderr.Wait(5000)) { throw 'Test process exited without pipe EOF' }
-                    $stdout.Result | Set-Content -LiteralPath "$runDir/$name.stdout.log" -Encoding utf8
-                    $stderr.Result | Set-Content -LiteralPath "$runDir/$name.stderr.log" -Encoding utf8
                 } catch {
                     $exitCode = -1
                     $errorText = $_.ToString()
@@ -68,6 +73,20 @@ public static class DaemonTestHost {
                     try {
                         if (-not $process.HasExited) { $process.Kill(); $null = $process.WaitForExit(5000) }
                     } catch { }
+                    if ($timedOut) {
+                        # Daemons the tests started run outside the test's process
+                        # tree; stop those started from test copies meanwhile.
+                        $temp = [IO.Path]::GetTempPath()
+                        Get-CimInstance Win32_Process | Where-Object {
+                            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($temp, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -ge $suiteStart
+                        } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                    }
+                    # Keep what the suite printed, also after a timeout.
+                    foreach ($stream in @(@{ task=$stdout; file="$runDir/$name.stdout.log" }, @{ task=$stderr; file="$runDir/$name.stderr.log" })) {
+                        try {
+                            if ($stream.task -and $stream.task.Wait(5000)) { $stream.task.Result | Set-Content -LiteralPath $stream.file -Encoding utf8 }
+                        } catch { }
+                    }
                     $process.Dispose()
                 }
                 $results += [pscustomobject]@{ name=$name; exitCode=$exitCode; seconds=$watch.Elapsed.TotalSeconds; error=$errorText }
@@ -113,8 +132,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not locate rustc' }
     $rustc = Join-Path $sysroot 'bin/rustc.exe'
     if (-not (Test-Path -LiteralPath $rustc)) { throw "Missing $rustc" }
+    # Update suites wait on 20-second handover deadlines and take several
+    # minutes on slower machines.
+    $suiteSeconds = 480
     $manifest = @{
-        workspace=$workspace; repeat=$Repeat; suites=$suites; rustc=$rustc
+        workspace=$workspace; repeat=$Repeat; suites=$suites; rustc=$rustc; suiteSeconds=$suiteSeconds
         userSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         runnerTrackingId=$env:RUNNER_TRACKING_ID
     }
@@ -129,7 +151,8 @@ try {
     try {
         $workerProcess = [Diagnostics.Process]::GetProcessById($created.ProcessId)
         $null = $workerProcess.Handle # Retain identity for timeout cleanup.
-        $deadline = [DateTime]::UtcNow.AddSeconds(600 * $Repeat)
+        # Every suite may use its whole budget, plus time to start the host.
+        $deadline = [DateTime]::UtcNow.AddSeconds(($suites.Count * $suiteSeconds + 120) * $Repeat)
         while (-not $workerProcess.WaitForExit(1000)) {
             if ([DateTime]::UtcNow -ge $deadline) { throw 'Independent test host timed out' }
         }

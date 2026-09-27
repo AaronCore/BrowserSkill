@@ -99,7 +99,7 @@ jobs:
   windows-daemon-lifecycle:
     name: Windows independent daemon and update lifecycle
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v6

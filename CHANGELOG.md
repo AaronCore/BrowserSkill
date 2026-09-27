@@ -25,6 +25,12 @@ Starting from 0.2.0, CLI / Extension / DSH Plugin share the same version number.
   previous executable is put back and the previous version restarted. It
   restarts the daemon from the installed path, which Linux no longer reports
   as the current executable once it is replaced.
+- A daemon that stops during an auto-update, for example because it went
+  idle while the release was downloading or being checked, installs nothing
+  or puts the previous executable back, and records the attempt as failed.
+- `bsk update` leaves a background daemon running when it could not start
+  one again, such as inside a sandbox whose Windows Job forbids breakaway
+  (`"daemon": "left_running"`), instead of stopping it.
 - A daemon keeps using the executable path it started from, so it can update
   again after a rolled-back update on Linux.
 - Updates of one executable are serialized through a lock file next to it, so
