@@ -1413,6 +1413,7 @@ mod tests {
         assert_eq!(extracted, b"windows binary");
     }
 
+    #[cfg(not(windows))]
     fn locked(target: &Path) -> UpdateLock {
         UpdateLock::try_acquire(target).unwrap()
     }

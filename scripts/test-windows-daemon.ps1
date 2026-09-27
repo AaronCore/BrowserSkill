@@ -49,12 +49,18 @@ public static class DaemonTestHost {
                 $process.StartInfo.CreateNoWindow = $true
                 $process.StartInfo.RedirectStandardOutput = $true
                 $process.StartInfo.RedirectStandardError = $true
+                # The suite's copies of bsk and the daemons they start live in
+                # its own temporary directory, so a timeout stops exactly those.
+                $suiteTemp = Join-Path $runDir "temp/$name"
+                $null = New-Item -ItemType Directory -Path $suiteTemp -Force
+                $suiteTemp = (Resolve-Path -LiteralPath $suiteTemp).Path.TrimEnd('\') + '\'
+                $process.StartInfo.EnvironmentVariables['TEMP'] = $suiteTemp
+                $process.StartInfo.EnvironmentVariables['TMP'] = $suiteTemp
                 $exitCode = -1
                 $errorText = $null
                 $stdout = $null
                 $stderr = $null
                 $timedOut = $false
-                $suiteStart = Get-Date
                 $watch = [Diagnostics.Stopwatch]::StartNew()
                 try {
                     if (-not $process.Start()) { throw 'Test process did not start' }
@@ -75,12 +81,14 @@ public static class DaemonTestHost {
                     } catch { }
                     if ($timedOut) {
                         # Daemons the tests started run outside the test's process
-                        # tree; stop those started from test copies meanwhile.
-                        $temp = [IO.Path]::GetTempPath()
+                        # tree; stop those running from this suite's copies.
                         Get-CimInstance Win32_Process | Where-Object {
-                            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($temp, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -ge $suiteStart
+                            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($suiteTemp, [StringComparison]::OrdinalIgnoreCase)
                         } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
                     }
+                    # Keep the logs, not the copies of bsk, for the artifact upload.
+                    Get-ChildItem -LiteralPath $suiteTemp -Recurse -Filter '*.exe' -ErrorAction SilentlyContinue |
+                        Remove-Item -Force -ErrorAction SilentlyContinue
                     # Keep what the suite printed, also after a timeout.
                     foreach ($stream in @(@{ task=$stdout; file="$runDir/$name.stdout.log" }, @{ task=$stderr; file="$runDir/$name.stderr.log" })) {
                         try {
