@@ -497,6 +497,35 @@ fn a_failed_handover_restores_the_previous_executable_and_keeps_serving() {
 }
 
 #[test]
+fn a_dynamic_port_daemon_resumes_on_the_port_it_was_given() {
+    let fixture = Fixture::new(release_whose_daemon_fails);
+    let old_pid = fixture.start_daemon(0);
+    let mut port = None;
+    fixture.wait_for("the daemon to serve", || {
+        port = fixture
+            .info()
+            .filter(|info| info["pid"] == old_pid)
+            .and_then(|info| info["ws_port"].as_u64());
+        port.is_some()
+    });
+    let port = port.unwrap();
+
+    fixture.wait_for("the resumed service to be confirmed", || {
+        fixture.record().is_some_and(|record| {
+            record["recovery"] == serde_json::json!({"state": "restored", "daemon_serving": true})
+        })
+    });
+
+    let info = fixture.info().unwrap();
+    assert_eq!(info["pid"], old_pid, "the previous daemon serves again");
+    assert_eq!(info["ws_port"], port, "{info}");
+    let port = u16::try_from(port).unwrap();
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .expect("browsers can reconnect to the original port");
+    fixture.status_succeeds();
+}
+
+#[test]
 fn manual_update_leaves_a_host_managed_daemon_to_its_owner() {
     let fixture = Fixture::new(newer_bsk);
     let port = unused_port();

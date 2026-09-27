@@ -404,6 +404,9 @@ fn run_daemon(cfg: &DaemonConfig) -> Result<()> {
             return Err(err);
         }
     };
+    // Browsers reconnect to the port served before a failed handover, so a
+    // `--port 0` daemon resumes on the port it was given, not a new one.
+    let mut resumed_cfg = cfg.clone();
     loop {
         let Stopped::HandOver(pending) = stopped else {
             return Ok(());
@@ -414,12 +417,14 @@ fn run_daemon(cfg: &DaemonConfig) -> Result<()> {
             handover::Finished::Resume {
                 lock: reclaimed,
                 record,
+                port,
             } => {
                 lock = reclaimed;
+                resumed_cfg.ws_port = port;
                 record
             }
         };
-        stopped = match serve(cfg, Some(&mut record)) {
+        stopped = match serve(&resumed_cfg, Some(&mut record)) {
             Ok(stopped) => stopped,
             Err(err) => {
                 record.serving_failed(&err);

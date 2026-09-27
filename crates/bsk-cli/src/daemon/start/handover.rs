@@ -46,11 +46,13 @@ pub(crate) struct Pending {
 pub(super) enum Finished {
     /// Another daemon serves, or none can; this process exits.
     Exit,
-    /// The handover failed and this process serves again under the lock.
-    /// `record` says so, and is confirmed once serving has resumed.
+    /// The handover failed and this process serves again under the lock, on
+    /// `port`, the one it served before. `record` says so, and is confirmed
+    /// once serving has resumed.
     Resume {
         lock: DaemonLock,
         record: Box<UpdateRecord>,
+        port: u16,
     },
 }
 
@@ -137,6 +139,7 @@ fn recover(pending: Pending, err: &anyhow::Error) -> Finished {
             Finished::Resume {
                 lock,
                 record: Box::new(record),
+                port,
             }
         }
         None if daemon_serving => {
