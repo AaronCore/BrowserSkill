@@ -9,6 +9,8 @@ Starting from 0.2.0, CLI / Extension / DSH Plugin share the same version number.
 
 ### Fixed
 
+- Protocol: preserve explicit `null` results when deserializing `ResponseFrame`,
+  restoring round-trip consistency while rejecting responses with both a result and an error.
 - A failed auto-update no longer leaves the browser disconnected
   ([#336](https://github.com/Tencent/BrowserSkill/issues/336)). The daemon
   checks that the new executable reports the release's version, starts a
