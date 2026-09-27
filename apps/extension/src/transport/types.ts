@@ -60,6 +60,7 @@ export type RpcErrorReason =
   | "confirmation_ui_unavailable"
   | "borrow_outcome_unknown"
   | "screenshot_capture_failed"
+  | "renderer_read_timeout"
   | "user_cancelled"
   | "page_hidden"
   | "navigation"
@@ -786,7 +787,7 @@ export type HelpOutcome =
 
 export interface HelpCompletionCondition {
   url_contains?: string;
-  url_matches?: string;
+  url_matches?: string | null;
   selector_exists?: string;
   selector_missing?: string;
   text_exists?: string;

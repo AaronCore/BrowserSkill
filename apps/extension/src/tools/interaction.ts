@@ -35,6 +35,7 @@ import type {
   SelectParams,
   SelectResult,
 } from "@/transport/types";
+import { type ClickOverlayDeps, withClickOverlay } from "./click-overlay";
 import { attachDialogs, markDialogCursor } from "./dialogs";
 import { backendNodeToObject } from "./element-geometry";
 import { rpcError } from "./errors";
@@ -52,16 +53,11 @@ import {
 } from "./shared";
 import { resolveSnapshotRef } from "./snapshot-ref";
 
-export interface InteractionDeps {
+export interface InteractionDeps extends ClickOverlayDeps {
   /** Arm short popup observation immediately before native input dispatch. */
   onInputSent?: (tabId: number) => void;
-  cdp: CdpRunner;
   tabsApi: ChromeTabsApi;
-  /** Abort hook (full chain wired in M10.2). */
-  signal?: AbortSignal;
   defaultTimeoutMs?: number;
-  /** Temporarily disable overlay click blocker during CDP automation. */
-  bypassOverlay?: (tabId: number, enabled: boolean) => Promise<void>;
   /** Keep hover hit-testing active for the caller's next observation/action. */
   keepOverlayBypassAfterHover?: boolean;
 }
@@ -514,39 +510,13 @@ export async function clickResolvedTarget(
   }
 
   const clickCount = params.click_count ?? 1;
-  if (clickCount < 1) {
-    return { code: "invalid_params", message: "click_count must be greater than zero" };
+  if (!Number.isSafeInteger(clickCount) || clickCount < 1) {
+    return { code: "invalid_params", message: "click_count must be a positive integer" };
   }
-  const overlayBlocking = await checkOverlayAtPoint(deps.cdp, target.tabId, centre.x, centre.y);
-  let automationBypassEnabled = false;
-  if (overlayBlocking && deps.bypassOverlay) {
-    try {
-      await deps.bypassOverlay(target.tabId, true);
-      automationBypassEnabled = true;
-    } catch (err) {
-      console.debug("[bsk interaction] overlay bypass enable failed", err);
-    }
-  }
-
-  try {
-    const error = await dispatchClickAtPoint(
-      target.tabId,
-      centre,
-      params,
-      deps,
-      undefined,
-      markSent,
-    );
-    if (error) return error;
-  } finally {
-    if (automationBypassEnabled && deps.bypassOverlay && !deps.keepOverlayBypassAfterHover) {
-      try {
-        await deps.bypassOverlay(target.tabId, false);
-      } catch (err) {
-        console.debug("[bsk interaction] overlay bypass disable failed", err);
-      }
-    }
-  }
+  const error = await withClickOverlay(target.tabId, centre, deps, (verifyOverlay) =>
+    dispatchClickAtPoint(target.tabId, centre, params, deps, verifyOverlay, undefined, markSent),
+  );
+  if (error) return error;
 
   return attachDialogs(deps.cdp, target.tabId, dialogCursor, {
     tab_id: target.tabId,
@@ -557,12 +527,13 @@ export async function clickResolvedTarget(
   });
 }
 
-/** Shared mouse lifecycle; visual clicks additionally verify after move and emit full double clicks. */
+/** Shared mouse lifecycle; visual clicks additionally verify their captured target. */
 async function dispatchClickAtPoint(
   tabId: number,
   point: { x: number; y: number },
   params: Pick<ClickParams, "button" | "click_count" | "modifiers">,
   deps: InteractionDeps,
+  verifyOverlay: () => Promise<RpcError | null>,
   beforePress?: () => Promise<RpcError | null>,
   markSent?: () => void,
 ): Promise<RpcError | null> {
@@ -581,7 +552,7 @@ async function dispatchClickAtPoint(
       modifiers,
     });
   const failure = (error: RpcError): RpcError =>
-    beforePress
+    beforePress || error.data?.reason === "input_not_ready"
       ? {
           ...error,
           data: {
@@ -603,14 +574,16 @@ async function dispatchClickAtPoint(
       const error = await beforePress();
       if (error) return failure(error);
     }
-    const counts = beforePress
-      ? Array.from({ length: params.click_count ?? 1 }, (_, i) => i + 1)
-      : [count];
-    for (count of counts) {
+    // clickCount describes this press in a consecutive sequence; it does not
+    // ask Chrome to synthesize the preceding clicks for DOM targets.
+    for (count = 1; count <= (params.click_count ?? 1); count++) {
       if (beforePress && count > 1) {
         const error = await beforePress();
         if (error) return failure(error);
       }
+      if (deps.signal?.aborted) return failure({ code: "cancelled", message: "click aborted" });
+      const blocked = await verifyOverlay();
+      if (blocked) return failure(blocked);
       if (deps.signal?.aborted) return failure({ code: "cancelled", message: "click aborted" });
       deps.onInputSent?.(tabId);
       markSent?.();
@@ -683,40 +656,42 @@ async function clickVisualPoint(
       return changed();
     return null;
   };
-  let bypass = false;
   try {
     deps.cdp.trackSessionTab?.(ctx.sessionId, target.tabId);
-    if (deps.bypassOverlay) {
-      await deps.bypassOverlay(target.tabId, true);
-      bypass = true;
-    }
-    const invalid = await validate();
-    if (invalid) return { ...invalid, data: { ...invalid.data, effect_state: "none" } };
-    const error = await dispatchClickAtPoint(
+    return await withClickOverlay<ClickResult | RpcError>(
       target.tabId,
       point,
-      params,
       deps,
-      async () => {
-        await wait(32, deps.signal); // Scheduling opportunity, not a claim of page stability.
-        return validate();
+      async (verifyOverlay) => {
+        const invalid = await validate();
+        if (invalid) return { ...invalid, data: { ...invalid.data, effect_state: "none" } };
+        const error = await dispatchClickAtPoint(
+          target.tabId,
+          point,
+          params,
+          deps,
+          verifyOverlay,
+          async () => {
+            await wait(32, deps.signal); // Scheduling opportunity, not a claim of page stability.
+            return validate();
+          },
+          markSent,
+        );
+        if (error) return error;
+        return attachDialogs(deps.cdp, target.tabId, dialogCursor, {
+          tab_id: target.tabId,
+          used_ref: capture.ref,
+          ...point,
+        });
       },
-      markSent,
+      true, // Visual target validation also needs the page blocker bypassed.
     );
-    if (error) return error;
-    return attachDialogs(deps.cdp, target.tabId, dialogCursor, {
-      tab_id: target.tabId,
-      used_ref: capture.ref,
-      ...point,
-    });
   } catch (error) {
     return {
       code: deps.signal?.aborted || isAbortError(error) ? "cancelled" : "cdp_failed",
       message: error instanceof Error ? error.message : String(error),
       data: { effect_state: "none" },
     };
-  } finally {
-    if (bypass) await deps.bypassOverlay!(target.tabId, false).catch(() => {});
   }
 }
 
