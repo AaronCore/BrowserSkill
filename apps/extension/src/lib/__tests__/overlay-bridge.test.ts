@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   isOverlayAgentOverlayResetMessage,
+  isOverlayAgentStateMessage,
   OVERLAY_AGENT_OVERLAY_RESET,
   OVERLAY_AGENT_STATE,
   OVERLAY_MSG_INTERRUPT,
-  type OverlayAgentStateMessage,
   type OverlayInterruptRequest,
   type OverlayInterruptResponse,
-  shouldApplyOverlayAgentState,
+  OverlayVersionGate,
 } from "@/lib/overlay-bridge";
 
 describe("OVERLAY_MSG_INTERRUPT", () => {
@@ -31,13 +31,24 @@ describe("OVERLAY_MSG_INTERRUPT", () => {
 });
 
 describe("isOverlayAgentOverlayResetMessage", () => {
-  it("accepts reset messages with a session id", () => {
+  it("accepts reset messages with a session id and a version", () => {
+    expect(
+      isOverlayAgentOverlayResetMessage({
+        type: OVERLAY_AGENT_OVERLAY_RESET,
+        sessionId: "sess-1",
+        epoch: "worker",
+        generation: 1,
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects reset messages without a version", () => {
     expect(
       isOverlayAgentOverlayResetMessage({
         type: OVERLAY_AGENT_OVERLAY_RESET,
         sessionId: "sess-1",
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("rejects reset messages without a session id", () => {
@@ -49,24 +60,33 @@ describe("isOverlayAgentOverlayResetMessage", () => {
   });
 });
 
-function state(
-  generation: number,
-  mode: OverlayAgentStateMessage["mode"] = "control",
-): OverlayAgentStateMessage {
-  return { type: OVERLAY_AGENT_STATE, sessionId: "sess-1", mode, generation };
-}
+describe("isOverlayAgentStateMessage", () => {
+  it("requires a version", () => {
+    const message = { type: OVERLAY_AGENT_STATE, sessionId: "sess-1", mode: "control" };
+    expect(isOverlayAgentStateMessage({ ...message, epoch: "worker", generation: 1 })).toBe(true);
+    expect(isOverlayAgentStateMessage({ ...message, generation: 1 })).toBe(false);
+  });
+});
 
-describe("shouldApplyOverlayAgentState", () => {
-  it("applies the first overlay state", () => {
-    expect(shouldApplyOverlayAgentState(null, state(1))).toBe(true);
+describe("OverlayVersionGate", () => {
+  it("admits the first message and the same message again", () => {
+    const gate = new OverlayVersionGate();
+    expect(gate.admit({ epoch: "worker", generation: 4 })).toBe(true);
+    expect(gate.admit({ epoch: "worker", generation: 4 })).toBe(true);
   });
 
-  it("applies an equal or newer generation", () => {
-    expect(shouldApplyOverlayAgentState(state(4, "control"), state(4, "paused"))).toBe(true);
-    expect(shouldApplyOverlayAgentState(state(4, "control"), state(5, "hidden"))).toBe(true);
+  it("orders messages from one worker by generation", () => {
+    const gate = new OverlayVersionGate();
+    expect(gate.admit({ epoch: "worker", generation: 6 })).toBe(true);
+    expect(gate.admit({ epoch: "worker", generation: 5 })).toBe(false);
+    expect(gate.admit({ epoch: "worker", generation: 7 })).toBe(true);
   });
 
-  it("drops a stale control state after a newer hide", () => {
-    expect(shouldApplyOverlayAgentState(state(6, "hidden"), state(5, "control"))).toBe(false);
+  it("follows a restarted worker and drops the one it replaced", () => {
+    const gate = new OverlayVersionGate();
+    expect(gate.admit({ epoch: "worker", generation: 20 })).toBe(true);
+    expect(gate.admit({ epoch: "restarted", generation: 1 })).toBe(true);
+    expect(gate.admit({ epoch: "worker", generation: 21 })).toBe(false);
+    expect(gate.admit({ epoch: "restarted", generation: 2 })).toBe(true);
   });
 });
