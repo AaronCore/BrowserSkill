@@ -189,6 +189,12 @@ pub(crate) fn extension_reconnected_error() -> RpcError {
     }
 }
 
+/// `data` for a call that failed because the extension's connection closed,
+/// so the CLI does not blame a protocol mismatch.
+pub(crate) fn extension_disconnected_data() -> serde_json::Value {
+    serde_json::json!({ "reason": "extension_disconnected" })
+}
+
 pub(crate) fn extension_unresponsive_error() -> RpcError {
     RpcError {
         code: ErrorCode::Timeout,

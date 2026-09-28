@@ -918,7 +918,11 @@ async fn forward_one(
             return Err(RpcError {
                 code: ErrorCode::ProtocolError,
                 message: "transport closed mid-call".into(),
-                data: is_native_input(&job.method).then(|| input_effect_data(None)),
+                data: Some(if is_native_input(&job.method) {
+                    input_effect_data(None)
+                } else {
+                    super::browsers::extension_disconnected_data()
+                }),
             });
         }
         WaitOutcome::Timeout => {
@@ -1014,7 +1018,7 @@ fn not_dispatched_error(
         _ => RpcError {
             code: ErrorCode::ProtocolError,
             message: "browser sink closed before request was queued".into(),
-            data: None,
+            data: Some(super::browsers::extension_disconnected_data()),
         },
     }
 }

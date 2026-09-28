@@ -280,6 +280,13 @@ pub fn info_for_error(code: ErrorCode, data: Option<&serde_json::Value>) -> Rend
             ),
             ..base
         },
+        (_, "extension_disconnected") => RenderInfo {
+            summary: "extension disconnected",
+            hint: Some(
+                "wait for the extension to reconnect, then start a new session; do not repeat a click, key press, upload, or download that may already have reached the page",
+            ),
+            ..base
+        },
         (_, "extension_reconnected") => RenderInfo {
             summary: "extension reconnected",
             hint: Some(
@@ -977,5 +984,12 @@ mod tests {
         );
         assert_eq!(reconnected.summary, "extension reconnected");
         assert!(reconnected.hint.unwrap().contains("do not repeat"));
+        let disconnected = info_for_error(
+            ErrorCode::ProtocolError,
+            Some(&serde_json::json!({"reason":"extension_disconnected"})),
+        );
+        assert_eq!(disconnected.summary, "extension disconnected");
+        assert_eq!(disconnected.exit_code, 2);
+        assert!(!disconnected.hint.unwrap().contains("protocol version"));
     }
 }
