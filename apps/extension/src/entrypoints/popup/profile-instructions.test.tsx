@@ -37,6 +37,14 @@ describe("profile instructions", () => {
     fireEvent.click(button);
     expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
   });
+  it("explains why the copy button is unavailable", () => {
+    const { rerender } = render(<ProfileInstructions instanceId="a1234567" connected={false} />);
+    expect(screen.getByText(i18n.t("extension:popup.profile.unavailableHint"))).toBeTruthy();
+    expect(screen.queryByText(i18n.t("extension:popup.profile.hint"))).toBeNull();
+    rerender(<ProfileInstructions instanceId="a1234567" connected />);
+    expect(screen.getByText(i18n.t("extension:popup.profile.hint"))).toBeTruthy();
+    expect(screen.queryByText(i18n.t("extension:popup.profile.unavailableHint"))).toBeNull();
+  });
   it("uses the current instance after a change and hides stale copy feedback", async () => {
     let resolveCopy: () => void = () => {};
     vi.mocked(navigator.clipboard.writeText).mockImplementationOnce(
