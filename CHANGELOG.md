@@ -15,6 +15,12 @@ Starting from 0.2.0, CLI / Extension / DSH Plugin share the same version number.
   at once instead of hanging until their timeout; inputs, transfers and tab borrows keep
   their unknown-outcome errors. `bsk doctor` and `bsk browsers` flag a connected
   extension that has stopped sending heartbeats.
+- Extension: input to a background Agent Window tab no longer keeps failing with
+  `input_not_ready` after Chrome drops the session's focus override without a detach
+  ([#355](https://github.com/Tencent/BrowserSkill/issues/355)). The session's
+  background-execution lease resends the override and waits for a rendered frame; the
+  input is sent only once the page reports `visible`, and otherwise still fails before
+  dispatch.
 - A failed auto-update no longer leaves the browser disconnected
   ([#336](https://github.com/Tencent/BrowserSkill/issues/336)). The daemon
   checks that the new executable reports the release's version, starts a
