@@ -429,9 +429,19 @@ mod tests {
     fn startup_recovery_survives_contexts_in_human_and_json_output() {
         use crate::daemon::start_error::DaemonStartFailure;
 
-        for failure in [
-            DaemonStartFailure::AutoStartDisabled,
-            DaemonStartFailure::IndependentStartFailed,
+        assert_ne!(
+            DaemonStartFailure::AutoStartDisabled.hint(),
+            DaemonStartFailure::IndependentStartFailed.hint()
+        );
+        for (failure, recovery_action) in [
+            (
+                DaemonStartFailure::AutoStartDisabled,
+                "restore the daemon in its owning environment with its original configuration",
+            ),
+            (
+                DaemonStartFailure::IndependentStartFailed,
+                "use `bsk daemon start --foreground` in a persistent host task",
+            ),
         ] {
             let error = anyhow::Error::new(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -454,9 +464,14 @@ mod tests {
                     .unwrap()
                     .contains("startup fixture cause")
             );
+            // Message-only consumers must still receive an actionable recovery step.
+            assert!(json["message"].as_str().unwrap().contains(recovery_action));
+            assert!(!json.to_string().contains("run_in_background"));
             assert!(json.get("data").is_none());
             let human = render_human_to_string(&cli, None);
             assert!(human.contains("startup fixture cause"));
+            assert!(human.contains(recovery_action));
+            assert!(!human.contains("run_in_background"));
             assert!(human.contains(&format!("hint: {}", failure.hint())));
             assert!(!human.contains("try `bsk daemon start` or `bsk status`"));
         }
@@ -464,9 +479,11 @@ mod tests {
 
     #[test]
     fn ordinary_local_errors_keep_their_existing_hint() {
+        use crate::daemon::start_error::DaemonStartFailure;
+
         // Even identical wording must not classify an untyped error as startup recovery.
         let cli = CliError::Local(anyhow::anyhow!(
-            "automatic daemon startup is disabled (BSK_AUTO_START=0)"
+            DaemonStartFailure::AutoStartDisabled.to_string()
         ));
         assert_eq!(
             hint_for(&cli, None),

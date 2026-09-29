@@ -158,7 +158,7 @@ fn disabled_auto_start_leaves_missing_and_stale_discovery_alone() {
             assert!(json["code"].is_null());
             let hint = json["hint"].as_str().unwrap();
             assert!(hint.contains("--foreground"), "{hint}");
-            assert!(hint.contains("run_in_background=true"), "{hint}");
+            assert!(!hint.contains("run_in_background"), "{hint}");
             assert!(!hint.contains("try `bsk daemon start` or `bsk status`"));
             let human = command(&home, &["status"])
                 .env("BSK_AUTO_START", "0")
