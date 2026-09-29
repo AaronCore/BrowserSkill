@@ -6,7 +6,7 @@
 // exactly the same sandbox + visibility rules as the M6 observation
 // handlers (review parity).
 
-import type { CdpDebuggee, DialogCursor } from "@/browser-driver/chromium-cdp";
+import type { CdpDebuggee, CdpDispatchGuard, DialogCursor } from "@/browser-driver/chromium-cdp";
 import type { CdpFrameGraph, CdpTarget } from "@/browser-driver/frame-graph";
 import {
   isAgentControlledTab,
@@ -58,11 +58,20 @@ export type { DialogCursor };
 export interface CdpRunner {
   send<T = unknown>(tabId: number, method: string, params?: object): Promise<T>;
   sendToTarget?<T = unknown>(target: CdpTarget, method: string, params?: object): Promise<T>;
-  detach?(tabId: number): Promise<void>;
+  /** Production dispatch boundary; optional for lightweight test runners. */
+  sendGuarded?<T = unknown>(
+    target: CdpTarget,
+    method: string,
+    params: object | undefined,
+    guard: CdpDispatchGuard,
+  ): Promise<T>;
+  detach?(tabId: number, expectedAttachmentId?: string): Promise<void>;
   getFrameGraph?(tabId: number): Promise<CdpFrameGraph>;
   getAttachmentId?(tabId: number): string | undefined;
   ensureAttachedToUrl?(tabId: number, expectedUrl: string | undefined): Promise<void>;
   acquireBackgroundExecution?(sessionId: string, tabId: number): Promise<void>;
+  /** Whether this session requests the persistent override, regardless of applied CDP state. */
+  ownsBackgroundExecution?(sessionId: string, tabId: number): boolean;
   trackSessionTab?(sessionId: string, tabId: number): void;
   releaseSessionTab?(sessionId: string, tabId: number): Promise<void>;
   onEvent?(handler: (source: CdpDebuggee, method: string, params: unknown) => void): {

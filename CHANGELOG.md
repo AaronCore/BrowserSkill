@@ -11,6 +11,10 @@ Starting from 0.2.0, CLI / Extension / DSH Plugin share the same version number.
 
 - Protocol: preserve explicit `null` results when deserializing `ResponseFrame`,
   restoring round-trip consistency while rejecting responses with both a result and an error.
+- Daemon: calls waiting on an extension connection that reconnects or closes now fail
+  at once instead of hanging until their timeout; inputs, transfers and tab borrows keep
+  their unknown-outcome errors. `bsk doctor` and `bsk browsers` flag a connected
+  extension that has stopped sending heartbeats.
 - A failed auto-update no longer leaves the browser disconnected
   ([#336](https://github.com/Tencent/BrowserSkill/issues/336)). The daemon
   checks that the new executable reports the release's version, starts a
