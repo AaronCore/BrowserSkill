@@ -125,6 +125,7 @@
     "remotePermissionsHint": "O servidor pode controlar janelas de tarefas dedicadas. A confirmação para tomar guias existentes emprestadas segue as configurações de automação abaixo.",
     "profile": {
       "hint": "Confira se este é o perfil do navegador que deseja usar e envie as instruções ao seu agente.",
+      "unavailableHint": "Conecte este perfil do navegador ao bsk para copiar as instruções.",
       "copyButton": "Copiar instruções do perfil",
       "copyFailed": "Não foi possível copiar as instruções. Tente novamente.",
       "promptTemplate": "Para esta tarefa, use o BrowserSkill neste perfil do navegador. Inicie cada nova sessão desta tarefa com a interface apropriada:\nCLI: {{command}}\nDeepSeek Harness: {{toolCall}}\nNo DeepSeek Harness, chame a ferramenta sem executar o comando CLI separadamente.\nSe esta instância não estiver conectada, pare e peça que eu reconecte este perfil. Não omita --browser / browser nem mude para outra instância."

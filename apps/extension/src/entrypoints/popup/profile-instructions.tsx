@@ -36,7 +36,9 @@ export function ProfileInstructions({
 
   return (
     <div className="mt-3 space-y-2 border-t border-border/70 pt-2" data-slot="popup-profile">
-      <p className="text-[11px] leading-snug text-muted-foreground">{t("popup.profile.hint")}</p>
+      <p className="text-[11px] leading-snug text-muted-foreground">
+        {t(ready ? "popup.profile.hint" : "popup.profile.unavailableHint")}
+      </p>
       <Button
         type="button"
         variant="secondary"
