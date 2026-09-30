@@ -5,6 +5,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 Starting from 0.2.0, CLI / Extension / DSH Plugin share the same version number.
 
+## [Unreleased]
+
+### Fixed
+
+- Extension: input to a background Agent Window tab no longer keeps failing with
+  `input_not_ready` after Chrome drops the session's focus override without a detach
+  ([#355](https://github.com/Tencent/BrowserSkill/issues/355)). The session's
+  background-execution lease resends the override and waits for a rendered frame; the
+  input is sent only once the page reports `visible`, and otherwise still fails before
+  dispatch.
+
 ## [0.3.2] - 2026-09-30
 
 ### Changed
