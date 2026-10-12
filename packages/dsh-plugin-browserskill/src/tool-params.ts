@@ -45,15 +45,13 @@ export const ELEMENT_WAIT_PARAMS = {
   target: {
     type: "string",
     description:
-      "wait-for-element: fresh @eN ref or an observed main-document CSS selector. " +
-      "CSS only: no text=, XPath, or Playwright locators.",
+      "wait-for-element: fresh @eN ref or observed main-document CSS selector; no text=, XPath or Playwright locators.",
   },
   state: {
     type: "string",
     enum: ["visible", "hidden", "attached", "detached"],
     description:
-      "wait-for-element state (default: visible). hidden includes absence; detached requires " +
-      "absence. visible does not mean enabled or ready for interaction.",
+      "wait-for-element (default: visible). hidden includes absence; visible does not mean enabled.",
   },
   pollMs: {
     type: "integer",

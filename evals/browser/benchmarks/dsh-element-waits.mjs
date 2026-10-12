@@ -16,6 +16,8 @@ const { values } = parseArgs({
   options: {
     chrome: { type: "string" },
     baseline: { type: "string" },
+    previous: { type: "string" },
+    candidate: { type: "string" },
     out: { type: "string" },
     samples: { type: "string", default: "5" },
     modes: { type: "string", default: "main,candidate" },
@@ -28,15 +30,23 @@ const { values } = parseArgs({
 assert(values.chrome && values.baseline && values.out, "Supply --chrome, --baseline and --out");
 const samples = Number(values.samples);
 assert(Number.isSafeInteger(samples) && samples > 0);
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const plugins = {
+  main: resolve(values.baseline),
+  candidate: resolve(
+    values.candidate ?? join(root, "packages/dsh-plugin-browserskill/lib/index.mjs"),
+  ),
+  ...(values.previous ? { previous: resolve(values.previous) } : {}),
+};
 const modes = values.modes.split(",");
-assert(modes.every((mode) => ["main", "candidate"].includes(mode)));
+assert(modes.every((mode) => Object.hasOwn(plugins, mode)));
+assert.equal(new Set(modes).size, modes.length);
 const cases = values.cases.split(",");
 assert(
   cases.every((name) =>
     ["static", "results", "enabled", "timeout", "unsupported", "stale"].includes(name),
   ),
 );
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const out = resolve(values.out);
 await mkdir(out, { recursive: true, mode: 0o700 });
 assert.equal(
@@ -108,6 +118,7 @@ function analyze(events) {
       return {
         ...start,
         durationMs: end ? end.atMs - start.atMs : null,
+        headersMs: headers ? headers.atMs - start.atMs : null,
         status: headers?.status,
         closeCode: end?.code,
       };
@@ -188,11 +199,11 @@ try {
     samples,
     modes,
     cases,
+    order: "Rotate the first arm each round; reverse every full rotation for three arms.",
     hashes: {},
   };
   for (const [label, file] of Object.entries({
-    baseline: resolve(values.baseline),
-    candidate: join(root, "packages/dsh-plugin-browserskill/lib/index.mjs"),
+    ...Object.fromEntries(modes.map((mode) => [mode, plugins[mode]])),
     cli: bskPath,
   }))
     metadata.hashes[label] = createHash("sha256")
@@ -264,9 +275,11 @@ try {
       }
       trials: for (const scenario of cases) {
         for (let round = 0; round < samples; round++) {
+          const order = modes.map((_, slot) => modes[(round + slot) % modes.length]);
+          if (modes.length === 3 && Math.floor(round / 3) % 2) order.reverse();
           for (let slot = 0; slot < modes.length; slot++) {
             if (stopRequested) break trials;
-            const mode = modes[(round + slot) % modes.length];
+            const mode = order[slot];
             const runId = `${scenario}-${round}-${mode}`;
             const fixtureId = randomUUID();
             const delayMs =
@@ -281,10 +294,7 @@ try {
             const tracePath = join(out, `${runId}.trace.jsonl`);
             const workspace = join(scratch, runId);
             await mkdir(workspace);
-            const plugin =
-              mode === "main"
-                ? resolve(values.baseline)
-                : join(root, "packages/dsh-plugin-browserskill/lib/index.mjs");
+            const plugin = plugins[mode];
             let configuredCli = bskPath;
             if (scenario === "unsupported") {
               configuredCli = join(workspace, "legacy-cli.mjs");
