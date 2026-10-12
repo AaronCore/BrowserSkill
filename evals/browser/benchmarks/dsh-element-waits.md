@@ -9,6 +9,13 @@ available after a timeout or unsupported command.
 **Status:** functional and recovery checks passed. End-to-end latency
 non-regression is not established, so this remains a draft for review.
 
+The [latency follow-up](dsh-element-waits-latency.md) separates model and tool
+costs and preserves both rejected and corrected instruction versions. The final
+40-pair ordinary-form comparison met its predeclared gate, and all 113 final
+tasks completed, including nine recovery trials. However, visible-but-disabled
+buttons became slower in both mean and median. The overall gate failed, so the
+PR remains in draft.
+
 ## Method for the original comparison
 
 - Baseline: main `5590e48cd6442a74aeb19d4e8658d5502dfa55b0`.
