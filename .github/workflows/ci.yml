@@ -251,6 +251,12 @@ jobs:
           BSK_CLICK_CHROME: google-chrome
         run: pnpm exec vitest run src/tools/__tests__/emulation-lifecycle.browser.test.ts
 
+      - name: Run fill browser regression
+        working-directory: apps/extension
+        env:
+          BSK_FILL_CHROME: google-chrome
+        run: pnpm exec vitest run src/tools/__tests__/fill.browser.test.ts
+
   browser-video:
     name: Browser video recording regression
     # Allows Chrome for Testing's user-namespace sandbox without a custom
