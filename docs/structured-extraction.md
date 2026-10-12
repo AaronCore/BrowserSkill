@@ -68,9 +68,9 @@ The canonical result has schema_version 1, kind, tab_id, and:
 | warnings | Generated names, partial DOM data, varying header associations or unavailable frames. |
 | targets | Discovery only: handles, container kinds/names, frame provenance and column previews. |
 
-JSON object member order is not column order. Iterate columns and read
-row[column.key]; do not relabel Object.values(row) by position. CSV already uses
-this key-based mapping, including tables with more than nine columns.
+CLI and plugin JSON list each row's keys in column order (c1, c2, ..., c10).
+columns remains the authoritative order and naming; read row[column.key]. CSV
+uses the same key mapping.
 
 Native HTML tables and ARIA tables/grids/treegrids support row/column spans, row headers,
 multiple header rows, explicit header IDs, footer rows and ARIA row/column indices.

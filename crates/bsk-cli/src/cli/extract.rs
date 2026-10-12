@@ -1,5 +1,5 @@
 //! Structured DOM extraction. Only this CLI writes agent-facing output paths.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -155,7 +155,7 @@ pub fn dispatch(args: ExtractArgs, format: Format) -> Result<(), CliError> {
         }
     }
     let daemon = ensure_daemon().context("ensure daemon is running")?;
-    let reply: ExtractResult = business_rpc::call(
+    let mut reply: ExtractResult = business_rpc::call(
         daemon.sock_path, "extract", Method::ToolExtract, Some(params), TOOL_IPC_TIMEOUT,
     ).map_err(|error| match error {
         CliError::Rpc { code: ErrorCode::UnknownMethod, .. } => CliError::Rpc {
@@ -165,7 +165,21 @@ pub fn dispatch(args: ExtractArgs, format: Format) -> Result<(), CliError> {
         },
         other => other,
     })?;
+    order_rows(&mut reply);
     render(&reply, &args, format).map_err(CliError::Local)
+}
+/// The daemon relays replies as JSON values, whose object keys come back
+/// sorted (c1, c10, c2, ...). Restore each row to `columns` order.
+fn order_rows(reply: &mut ExtractResult) {
+    let order: HashMap<&str, usize> = reply
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| (column.key.as_str(), index))
+        .collect();
+    for row in &mut reply.rows {
+        row.sort_by_cached_key(|key, _| order.get(key.as_str()).copied().unwrap_or(usize::MAX));
+    }
 }
 fn metadata_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -393,6 +407,36 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
+    }
+
+    #[test]
+    fn json_rows_follow_column_order_after_sorted_transport() {
+        let mut reply = sample();
+        reply.columns = (1..=11)
+            .map(|index| {
+                serde_json::from_value(json!({
+                    "key": format!("c{index}"), "name": format!("H{index}"),
+                    "header_path": [], "name_source": "generated"
+                }))
+                .unwrap()
+            })
+            .collect();
+        // serde_json::Value objects (used by the daemon relay) sort their keys.
+        let sorted: Value = serde_json::from_value(json!({
+            "c1": "1", "c2": "2", "c3": "3", "c4": "4", "c5": "5", "c6": "6",
+            "c7": "7", "c8": "8", "c9": "9", "c10": "10", "c11": "11"
+        }))
+        .unwrap();
+        reply.rows = vec![serde_json::from_value(sorted).unwrap()];
+        reply.row_sources.truncate(1);
+        assert_eq!(reply.rows[0].keys().nth(2).unwrap(), "c11");
+        order_rows(&mut reply);
+        let printed = serde_json::to_string(&reply.rows[0]).unwrap();
+        assert!(
+            printed.starts_with(r#"{"c1":"1","c2":"2","c3":"3""#),
+            "{printed}"
+        );
+        assert!(printed.ends_with(r#""c10":"10","c11":"11"}"#), "{printed}");
     }
 
     #[test]

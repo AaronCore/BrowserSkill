@@ -42,7 +42,7 @@ target and ref are mutually exclusive.
 
 Values stay strings. Empty cells are empty strings; missing/covered cells are
 null. Headers, spans, row positions and page/frame URLs are returned separately.
-Read each row by columns[].key; JSON object key order does not define column order.
+Row keys follow column order; still read each value by columns[].key.
 
 Raw CSV preserves formula-like text; use --csv-safe for untrusted spreadsheet
 imports. Originals are recorded in the sidecar. Verify its CSV hash after an

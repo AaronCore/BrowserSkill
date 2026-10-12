@@ -1,6 +1,5 @@
 //! Bounded, passive extraction from the currently loaded DOM.
-use std::collections::BTreeMap;
-
+use indexmap::IndexMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -151,7 +150,8 @@ pub struct ExtractResult {
     pub tab_id: i64,
     pub source: ExtractSource,
     pub columns: Vec<ExtractColumn>,
-    pub rows: Vec<BTreeMap<String, Option<String>>>,
+    /// Each row's keys follow `columns` order.
+    pub rows: Vec<IndexMap<String, Option<String>>>,
     pub row_sources: Vec<ExtractRowSource>,
     pub spans: Vec<ExtractSpan>,
     pub coverage: ExtractCoverage,
