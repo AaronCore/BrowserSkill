@@ -185,8 +185,10 @@ browser_inspect({ action: "extract", session: "<id>", extractKind: "table", sele
 ~~~
 
 List extraction uses itemSelector and the fields-object JSON string in
-extractFields. Budgets are maxRows, maxColumns, maxBytes and extractTimeoutMs. CSV requires an
-output path so the plugin always receives structured JSON. The plugin uses the
+extractFields. Budgets are maxRows, maxColumns, maxBytes and extractTimeoutMs.
+Rows returned inline enter the model context, so maxBytes defaults to 262144
+there (1048576 when writing output), and the plugin renders compact JSON. CSV
+requires an output path so the plugin always receives structured JSON. The plugin uses the
 normal session registry, runner and queue; it does not introduce arbitrary
 page-script evaluation. Output paths are on the CLI host; relative paths resolve
 against that process's working directory. Prefer absolute paths in harness calls.

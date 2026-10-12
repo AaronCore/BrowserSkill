@@ -3,6 +3,12 @@ import { appendTabId, type PhaseOneRuntime, type ToolRegistrar } from "./phase-o
 import { SESSION_PARAM, TAB_ID_PARAM } from "./tool-params";
 import type { ToolDeps } from "./tools";
 
+/**
+ * Rows returned inline enter the model context; keep that default near the
+ * HTML default. File exports keep the CLI's 1 MiB default.
+ */
+export const INLINE_EXTRACT_MAX_BYTES = 262_144;
+
 export const EXTRACT_PARAMETERS = {
   extractKind: {
     type: "string",
@@ -68,12 +74,14 @@ export function registerExtractTool(
         },
         maxBytes: {
           type: "integer",
-          description: "Total JSON byte budget, 1024..4194304; default 1048576.",
+          description:
+            "Total JSON byte budget, 1024..4194304; default 262144 inline, 1048576 with output.",
         },
       },
       output: {
         schema: { type: "json" },
-        render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }],
+        // Compact JSON keeps the rendered size within the requested byte budget.
+        render: (_args, value) => [{ type: "text", text: JSON.stringify(value) }],
       },
       isConcurrencySafe: () => false,
       async execute(args, exec) {
@@ -103,7 +111,7 @@ export function registerExtractTool(
           [args.extractFields, "--fields-json"],
           [args.maxRows, "--max-rows"],
           [args.maxColumns, "--max-columns"],
-          [args.maxBytes, "--max-bytes"],
+          [args.maxBytes ?? (args.output ? undefined : INLINE_EXTRACT_MAX_BYTES), "--max-bytes"],
           [args.extractTimeoutMs, "--timeout-ms"],
           [args.extractFormat, "--format"],
           [args.output, "--out"],

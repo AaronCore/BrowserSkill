@@ -1944,6 +1944,30 @@ describe("structured extraction", () => {
       "--csv-safe",
     ]);
   });
+  it("bounds rows returned inline but not rows written to a file", async () => {
+    const { tools, calls } = setup({
+      "session start": START_REPLY("s1"),
+      "extract table": { schema_version: 1, rows: [] },
+    });
+    await startSession(tools);
+    const inspect = tools.get("browser_inspect")!;
+    await inspect.execute({ action: "extract", extractKind: "table", selector: "#t" }, makeExec());
+    expect(calls.at(-1)?.args).toEqual([
+      "extract",
+      "table",
+      "--session",
+      "s1",
+      "--selector",
+      "#t",
+      "--max-bytes",
+      "262144",
+    ]);
+    await inspect.execute(
+      { action: "extract", extractKind: "table", selector: "#t", output: "/tmp/t.json" },
+      makeExec(),
+    );
+    expect(calls.at(-1)?.args).not.toContain("--max-bytes");
+  });
   it.each([
     { selector: "#table", extractTarget: "xt_fixture" },
     { extractFormat: "csv" },
