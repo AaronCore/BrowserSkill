@@ -51,3 +51,16 @@ HTTP time includes network/provider service and generation, so it alone does
 not prove random model fluctuation. Changed descriptions can affect generation
 and planning. Report their measured token cost and observed action differences;
 do not assign all inference variation to either the feature or randomness.
+
+## Diagnostic follow-up before confirmation
+
+The six-round diagnostic completed on `5be7d9f4`. Shorter descriptions alone did
+not help: candidate tasks preloaded the interaction reference in 3/6 trials,
+despite no pending content. Keep these results. Restore the main skill entry's
+reference triggers, leaving the wait's contract in its action/parameter schema
+and its detailed documentation available in the interaction reference. This
+avoids adding a mandatory reference read for an otherwise self-contained action.
+
+Run six exploratory pairs comparing the trim-only plugin with this scoped entry
+before the independent confirmation. No confirmation data has been collected or
+used to choose either change. The original confirmation size and gate stay fixed.
