@@ -27,6 +27,7 @@ import {
   type OverlayMessage,
   type OverlayMode,
 } from "@/lib/overlay-bridge";
+import { nextOverlayVersion } from "@/lib/overlay-version";
 import { POPUP_PORT_NAME, type PopupInbound, type PopupOutbound } from "@/lib/popup-bridge";
 import { recordFrameCoordinator } from "@/lib/recording/frame-coordinator";
 import { attachSessionsLiveFlag } from "@/lib/sessions-live-flag";
@@ -51,13 +52,17 @@ import {
   attachRecordStepListener,
   type RecordRuntimeDeps,
 } from "@/tools/record";
-import { chromeTabsApi } from "@/tools/shared";
+import { cdpBlockedUrlReason, chromeTabsApi } from "@/tools/shared";
 import { chromeTabMutationApi } from "@/tools/tabs";
 import { detectBrowserMeta } from "@/transport/handshake";
 import { watchRemoteAuthorization } from "@/transport/remote-authorization";
 import { type RemoteEndpoint, remoteSocket } from "@/transport/remote-endpoint";
 import type { Transport } from "@/transport/transport";
 import { WSTransport } from "@/transport/ws-transport";
+import { attachVideoBridge } from "@/video/bridge";
+import { BrowserVideoHost } from "@/video/host";
+import { VideoManager } from "@/video/manager";
+import { VIDEO_OVERLAY } from "@/video/overlay";
 
 export default defineBackground(() => {
   const controller = new ConnectionController();
@@ -94,12 +99,65 @@ export default defineBackground(() => {
   });
   const debug = new DebugManager(sessions, cdp, chrome.tabs, Date.now, new LocalDebugArchive());
   attachDebugBridge(sessions, debug);
+  const videoHost = new BrowserVideoHost();
+  const video = new VideoManager({
+    sessions,
+    cdp,
+    tabs: chromeTabsApi,
+    host: videoHost,
+    owner: () => requestedConnection?.key ?? "unavailable",
+    overlay: async (tabId, recordingId) => {
+      try {
+        // Another content script can receive messages before the overlay script
+        // mounts, resolving undefined instead of reporting a missing receiver.
+        // The overlay stays hidden until its own video handshake completes.
+        return (
+          (await chrome.tabs.sendMessage(
+            tabId,
+            { type: VIDEO_OVERLAY, recording_id: recordingId },
+            { frameId: 0 },
+          )) ?? {}
+        );
+      } catch (error) {
+        // Error pages, downloads and PDF viewers may have no content script.
+        // A receiving script must confirm a clean paint; absent scripts have no overlay.
+        const tab = await chrome.tabs.get(tabId);
+        if (
+          !recordingId ||
+          tab.url === "about:blank" ||
+          (error instanceof Error && error.message.includes("Receiving end does not exist"))
+        )
+          return {};
+        throw error;
+      }
+    },
+    changed: () => {
+      void chrome.action.setBadgeBackgroundColor({ color: "#dc2626" });
+      void chrome.action.setBadgeText({ text: video.isRecording() ? "REC" : "" });
+    },
+  });
+  attachVideoBridge(video, videoHost, (sessionId) => handleOverlayInterrupt(transport, sessionId));
+  chrome.webNavigation.onBeforeNavigate.addListener((details) => {
+    if (details.frameId !== 0) return;
+    if (cdpBlockedUrlReason(details.url))
+      void video.stopTab(details.tabId, "capture_failed").catch(() => {});
+    else void video.navigationStarted(details.tabId, details.timeStamp).catch(() => {});
+  });
+  chrome.webNavigation.onCompleted.addListener((details) => {
+    if (details.frameId === 0)
+      void video.navigationSettled(details.tabId, details.timeStamp).catch(() => {});
+  });
+  chrome.webNavigation.onErrorOccurred.addListener((details) => {
+    if (details.frameId === 0)
+      void video.navigationSettled(details.tabId, details.timeStamp).catch(() => {});
+  });
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId !== undefined) debug.stopTab(source.tabId, "debugger_detached");
+    if (source.tabId !== undefined)
+      void video.stopTab(source.tabId, "debugger_detached").catch(() => {});
   });
   const sessionsLive = attachSessionsLiveFlag({ manager: sessions });
   const popupSnapshotRefreshers = new Set<() => void>();
-  let overlayGeneration = 0;
   const controlModes = new Map<string, OverlayMode>();
 
   watchRemoteAuthorization();
@@ -140,7 +198,6 @@ export default defineBackground(() => {
   function setControlMode(sessionId: string, mode: OverlayMode): void {
     if (controlModes.get(sessionId) === mode) return;
     controlModes.set(sessionId, mode);
-    overlayGeneration += 1;
     const ctx = sessions.get(sessionId);
     if (ctx) void pushOverlayStateForWindow(ctx.agentWindowId);
   }
@@ -152,14 +209,14 @@ export default defineBackground(() => {
         type: OVERLAY_AGENT_STATE,
         sessionId: null,
         mode: "hidden",
-        generation: overlayGeneration,
+        ...nextOverlayVersion(),
       };
     }
     return {
       type: OVERLAY_AGENT_STATE,
       sessionId: ctx.sessionId,
       mode: controlModes.get(ctx.sessionId) ?? "control",
-      generation: overlayGeneration,
+      ...nextOverlayVersion(),
     };
   }
 
@@ -177,7 +234,7 @@ export default defineBackground(() => {
       type: OVERLAY_AGENT_STATE,
       sessionId: null,
       mode: "hidden",
-      generation: overlayGeneration,
+      ...nextOverlayVersion(),
     };
   }
 
@@ -216,12 +273,12 @@ export default defineBackground(() => {
 
   function onOverlaySessionStateChanged(): void {
     debug.sync();
+    video.sync();
     void sessionsLive.syncFromManager();
     const liveSessionIds = new Set(sessions.list().map((ctx) => ctx.sessionId));
     for (const sessionId of controlModes.keys()) {
       if (!liveSessionIds.has(sessionId)) controlModes.delete(sessionId);
     }
-    overlayGeneration += 1;
     pushAllAgentOverlayStates();
     for (const refresh of popupSnapshotRefreshers) refresh();
   }
@@ -253,6 +310,7 @@ export default defineBackground(() => {
     void pushOverlayStateForTab(tab.id, tab.windowId);
   });
   chrome.tabs.onDetached.addListener((tabId) => {
+    void video.stopTab(tabId, "session_ended").catch(() => {});
     debug.releaseTab(tabId);
     const releasedSessionIds = sessions.releaseObservedTab(tabId);
     if (releasedSessionIds.length > 0) void pushOverlayStateForTab(tabId);
@@ -262,6 +320,7 @@ export default defineBackground(() => {
         .catch((error) => console.debug("[bsk] observed tab release failed", error));
   });
   chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+    void video.stopTab(tabId, "tab_closed").catch(() => {});
     debug.stopTab(tabId, "tab_closed");
     sessions.forgetClosedTab(tabId, { isWindowClosing: removeInfo.isWindowClosing });
     debug.sync();
@@ -321,6 +380,7 @@ export default defineBackground(() => {
   void interactionPreferences.readyOrFallback();
   const dispatcher = new ToolDispatcher({
     debug,
+    video,
     interactionPreferences,
     transport,
     sessions,
@@ -441,6 +501,9 @@ export default defineBackground(() => {
     ]);
     controller.setAuditEnabled(auditEnabled);
     const cleanup = async () => {
+      await video
+        .disconnect()
+        .catch((error) => console.warn("Video finalization failed during disconnect", error));
       debug.dispose();
       const report = await cleanupAfterDisconnect();
       if (report.failures.length > 0) {

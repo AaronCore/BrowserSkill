@@ -71,6 +71,7 @@ pub mod reason {
     pub const FILE_DROP_TARGET_UNAVAILABLE: &str = "file_drop_target_unavailable";
     pub const FILE_DROP_FAILED: &str = "file_drop_failed";
     pub const DOWNLOAD_CAPTURE_FAILED: &str = "download_capture_failed";
+    pub const DOWNLOAD_PATH_MISMATCH: &str = "download_path_mismatch";
     pub const TRANSFER_OUTCOME_UNKNOWN: &str = "transfer_outcome_unknown";
     pub const TRANSFER_TIMEOUT: &str = "transfer_timeout";
     pub const SESSION_BUSY: &str = crate::rpc_reason::SESSION_BUSY;
@@ -270,6 +271,27 @@ pub fn info_for_error(code: ErrorCode, data: Option<&serde_json::Value>) -> Rend
             summary: "input completed but temporary browser state could not be restored",
             hint: Some(
                 "do not repeat the input; observe the page to check its result before continuing",
+            ),
+            ..base
+        },
+        (_, "extension_unresponsive") => RenderInfo {
+            summary: "extension is not responding",
+            hint: Some(
+                "the browser is still connected; wait for it to recover, or reload the extension if commands keep failing",
+            ),
+            ..base
+        },
+        (_, "extension_disconnected") => RenderInfo {
+            summary: "extension disconnected",
+            hint: Some(
+                "wait for the extension to reconnect, then start a new session; do not repeat a click, key press, upload, or download that may already have reached the page",
+            ),
+            ..base
+        },
+        (_, "extension_reconnected") => RenderInfo {
+            summary: "extension reconnected",
+            hint: Some(
+                "start a new session; do not repeat a click, key press, upload, or download that may already have reached the page",
             ),
             ..base
         },
@@ -549,6 +571,13 @@ pub fn info_for_error(code: ErrorCode, data: Option<&serde_json::Value>) -> Rend
             ),
             exit_code: base.exit_code,
         },
+        (ErrorCode::CdpFailed, reason::DOWNLOAD_PATH_MISMATCH) => RenderInfo {
+            summary: "the browser did not use the requested download directory",
+            hint: Some(
+                "find the saved file in the browser's Downloads list; check for a competing rename, a browser-rejected filename, or a different save location before retrying",
+            ),
+            exit_code: base.exit_code,
+        },
         _ => base,
     }
 }
@@ -817,6 +846,15 @@ mod tests {
         let info = info_for_error(ErrorCode::CdpFailed, Some(&download));
         assert!(info.summary.contains("download could not be attributed"));
 
+        let path_mismatch = serde_json::json!({
+            "reason": reason::DOWNLOAD_PATH_MISMATCH,
+            "effect_state": "committed",
+            "phase": "download"
+        });
+        let info = info_for_error(ErrorCode::CdpFailed, Some(&path_mismatch));
+        assert!(info.summary.contains("requested download directory"));
+        assert!(info.hint.unwrap().contains("browser-rejected filename"));
+
         let unknown = serde_json::json!({ "reason": reason::TRANSFER_OUTCOME_UNKNOWN });
         let info = info_for_error(ErrorCode::ProtocolError, Some(&unknown));
         assert!(info.summary.contains("outcome could not be confirmed"));
@@ -947,5 +985,28 @@ mod tests {
                 .contains("may already have taken effect")
         );
         assert_eq!(timeout.exit_code, 4);
+    }
+
+    #[test]
+    fn extension_link_reasons_match_the_connection_state() {
+        let silent = info_for_error(
+            ErrorCode::Timeout,
+            Some(&serde_json::json!({"reason":"extension_unresponsive"})),
+        );
+        assert_eq!(silent.summary, "extension is not responding");
+        assert_eq!(silent.exit_code, 4);
+        let reconnected = info_for_error(
+            ErrorCode::ProtocolError,
+            Some(&serde_json::json!({"reason":"extension_reconnected"})),
+        );
+        assert_eq!(reconnected.summary, "extension reconnected");
+        assert!(reconnected.hint.unwrap().contains("do not repeat"));
+        let disconnected = info_for_error(
+            ErrorCode::ProtocolError,
+            Some(&serde_json::json!({"reason":"extension_disconnected"})),
+        );
+        assert_eq!(disconnected.summary, "extension disconnected");
+        assert_eq!(disconnected.exit_code, 2);
+        assert!(!disconnected.hint.unwrap().contains("protocol version"));
     }
 }

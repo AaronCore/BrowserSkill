@@ -6,6 +6,7 @@ import { OVERLAY_AGENT_STATE, type OverlayAgentStateMessage } from "@/lib/overla
 import { attachSessionsLiveFlag } from "@/lib/sessions-live-flag";
 import { isAgentControlledTab } from "@/session-manager/manager";
 import { ToolDispatcher } from "@/tools/dispatcher";
+import { VideoManager } from "@/video/manager";
 
 vi.hoisted(() => {
   Object.assign(globalThis, { defineBackground: (main: unknown) => main });
@@ -17,6 +18,9 @@ vi.mock("@/browser-driver/chromium-cdp");
 vi.mock("@/debug/archive");
 vi.mock("@/debug/bridge");
 vi.mock("@/debug/manager");
+vi.mock("@/video/manager");
+vi.mock("@/video/bridge");
+vi.mock("@/video/host");
 vi.mock("@/lib/audit");
 vi.mock("@/lib/audit-bridge");
 vi.mock("@/lib/connection-controller");
@@ -63,12 +67,16 @@ function event<T extends unknown[] = []>() {
 async function fixture() {
   const overlay = new OverlayController();
   const onDetached = event<[number]>();
-  const sendMessage = vi.fn(async (_tabId: number, message: OverlayAgentStateMessage) => {
-    overlay.applyAgentControlMode(message.sessionId, message.mode);
-  });
+  const sendMessage = vi.fn(
+    async (_tabId: number, message: OverlayAgentStateMessage): Promise<unknown> => {
+      overlay.applyAgentControlMode(message.sessionId, message.mode);
+      return undefined;
+    },
+  );
   vi.stubGlobal("chrome", {
     tabs: {
       sendMessage,
+      get: vi.fn(async () => ({ url: "https://example.test" })),
       onDetached,
       onActivated: event(),
       onUpdated: event(),
@@ -76,6 +84,7 @@ async function fixture() {
       onRemoved: event(),
     },
     debugger: { onDetach: event() },
+    webNavigation: { onBeforeNavigate: event(), onCompleted: event(), onErrorOccurred: event() },
     runtime: { onMessage: event(), onConnect: event() },
     notifications: { onClicked: event(), onButtonClicked: event() },
   });
@@ -85,6 +94,7 @@ async function fixture() {
     syncFromManager: vi.fn(async () => {}),
   });
   vi.mocked(ChromiumCdp.prototype.releaseSessionTab).mockResolvedValue();
+  vi.mocked(VideoManager.prototype.stopTab).mockResolvedValue();
   (background as unknown as () => void)();
   const deps = vi.mocked(ToolDispatcher).mock.calls.at(-1)![0];
   const task = await deps.sessions.start("one");
@@ -97,14 +107,20 @@ it.each([false, true])("hides an observed tab after detachment, remote=%s", asyn
   f.task.observedTabs = new Set([20]);
   f.deps.onAgentTabClaimed?.(20, 10);
   expect(shouldShowAgentControlOverlay(f.overlay.snapshot())).toBe(true);
+  const claimed = f.sendMessage.mock.lastCall![1];
   f.onDetached.emit(20);
   expect(isAgentControlledTab(f.task, 20)).toBe(false);
-  expect(f.sendMessage).toHaveBeenLastCalledWith(20, {
+  const [tabId, released] = f.sendMessage.mock.lastCall!;
+  expect(tabId).toBe(20);
+  expect(released).toMatchObject({
     type: OVERLAY_AGENT_STATE,
     sessionId: null,
     mode: "hidden",
-    generation: 0,
   });
+  // The release is ordered after the claim, although no session changed.
+  expect(released.epoch).toEqual(expect.any(String));
+  expect(released.epoch).toBe(claimed.epoch);
+  expect(released.generation).toBeGreaterThan(claimed.generation);
   expect(shouldShowAgentControlOverlay(f.overlay.snapshot())).toBe(false);
   expect(f.deps.cdp?.releaseSessionTab).toHaveBeenCalledWith("one", 20);
 });
@@ -126,4 +142,15 @@ it("does not reset tabs without an observed claim", async () => {
   expect(f.sendMessage).not.toHaveBeenCalled();
   expect(f.deps.cdp?.releaseSessionTab).not.toHaveBeenCalled();
   expect(isAgentControlledTab(f.task, 10)).toBe(true);
+});
+
+it("accepts an absent video listener but preserves real overlay replies and errors", async () => {
+  const f = await fixture();
+  const video = vi.mocked(VideoManager).mock.calls.at(-1)![0];
+  for (const reply of [undefined, null, { interactive: true }]) {
+    f.sendMessage.mockResolvedValueOnce(reply);
+    await expect(video.overlay(10, "video")).resolves.toEqual(reply ?? {});
+  }
+  f.sendMessage.mockRejectedValueOnce(new Error("Overlay paint failed"));
+  await expect(video.overlay(10, "video")).rejects.toThrow("Overlay paint failed");
 });

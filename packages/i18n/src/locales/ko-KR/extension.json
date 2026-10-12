@@ -61,7 +61,9 @@
       "save": "저장",
       "hint": "에이전트에게 브라우저를 지정할 때 사용할 고유한 이름을 입력하세요. 저장하면 BrowserSkill이 잠시 다시 연결됩니다.",
       "busyHint": "활성 브라우저 작업을 마친 후 이 이름을 변경하세요.",
-      "instanceIdError": "8자리 16진수 인스턴스 ID 형식이 아닌 이름을 선택하세요."
+      "instanceIdError": "8자리 16진수 인스턴스 ID 형식이 아닌 이름을 선택하세요.",
+      "edit": "브라우저 이름 변경",
+      "cancel": "취소"
     },
     "record": {
       "sectionTitle": "작업 기록",
@@ -124,10 +126,13 @@
     "remotePermissionsInfo": "원격 연결 권한 안내",
     "remotePermissionsHint": "서버는 전용 작업 창을 제어할 수 있습니다. 기존 탭을 빌릴 때의 확인 여부는 아래 자동화 설정을 따릅니다.",
     "profile": {
-      "hint": "사용하려는 브라우저 프로필이 맞는지 확인한 뒤 에이전트에게 지침을 보내세요.",
-      "copyButton": "프로필 지침 복사",
+      "hint": "이 브라우저를 사용하도록 에이전트에게 지침을 보내세요.",
+      "unavailableHint": "지침을 복사하려면 이 브라우저 프로필을 bsk에 연결하세요.",
+      "copyButton": "지침 복사",
       "copyFailed": "지침을 복사하지 못했습니다. 다시 시도해 주세요.",
-      "promptTemplate": "이 작업에는 이 브라우저 프로필의 BrowserSkill을 사용하세요. 이 작업의 새 세션을 시작할 때마다 해당 인터페이스를 사용하세요:\nCLI: {{command}}\nDeepSeek Harness: {{toolCall}}\nDeepSeek Harness에서는 CLI 명령을 별도로 실행하지 말고 도구 호출을 사용하세요.\n이 인스턴스가 연결되어 있지 않으면 중단하고 이 프로필을 다시 연결해 달라고 요청하세요. --browser / browser를 생략하거나 다른 인스턴스로 전환하지 마세요."
+      "promptTemplate": "이 작업에는 브라우저 {{name}}(인스턴스 ID: {{instanceId}})의 BrowserSkill을 사용하세요. 이 작업의 새 세션을 시작할 때마다 해당 인터페이스를 사용하세요:\nCLI: {{command}}\nDeepSeek Harness: {{toolCall}}\nDeepSeek Harness에서는 CLI 명령을 별도로 실행하지 말고 도구 호출을 사용하세요.\n이 인스턴스가 연결되어 있지 않으면 중단하고 이 프로필을 다시 연결해 달라고 요청하세요. --browser / browser를 생략하거나 다른 인스턴스로 전환하지 마세요.",
+      "title": "현재 브라우저",
+      "unnamed": "이름 없는 브라우저"
     }
   },
   "controlOverlay": {
@@ -602,5 +607,63 @@
     "perfReason_capture_interrupted": "수집 중단",
     "perfReason_navigation_checkpoint_missing": "탐색 전 최종 스냅샷 누락",
     "perfReason_browser_restarted": "브라우저 재시작으로 마지막 갱신 누락 가능"
+  },
+  "video": {
+    "title": "Video recording",
+    "cardDesc": "Record a task tab as an MP4 video",
+    "description": "Record one authorized task tab. MP4, no audio. The recording stays on this tab when you switch tabs.",
+    "remaining": "{{time}} remaining",
+    "backgroundHint": "You can close this popup. Stopping the video keeps the task running.",
+    "stop": "Stop recording",
+    "interrupt": "Stop task actions",
+    "noTask": "Manual recording needs a running task and an authorized tab. You can copy the agent prompt above before starting a task.",
+    "task": "Task",
+    "tab": "Fixed tab",
+    "chooseTask": "Choose a task",
+    "chooseTab": "Choose a tab",
+    "duration": "Limit (1–600 seconds)",
+    "quality": "Quality",
+    "standard": "Standard · 1280 / 15 fps",
+    "clear": "Clear · 1920 / 30 fps",
+    "start": "Start recording",
+    "copyPrompt": "Copy agent prompt",
+    "copied": "Copied",
+    "prompt": "Please record the browser task I request as a silent MP4, with a {{duration}}-second limit and {{quality}} quality. Use the video controls provided by your browser tools or CLI. Create or reuse this task’s authorized tab, start recording and confirm it is active before navigation or task operations. If recording fails, tell me before proceeding without video. Keep the recorded tab fixed. Stop recording before ending the task, and tell me whether the video is complete or limited/interrupted. Keep it for preview and Save As in the extension’s Features → Video recording. Export only to a destination I specify; ask where if needed.",
+    "recent": "Recent recordings ({{count}})",
+    "partial": "Partial recording — preserved video is available",
+    "saved": "Saved",
+    "waitingForUser": "Waiting for user confirmation",
+    "unsaved": "Recording complete · waiting to save",
+    "retention": "Recordings stay in this browser for 24 hours. Save important videos before they expire.",
+    "library": "Recent recordings",
+    "empty": "No recent recordings.",
+    "playbackError": "This browser could not play the video. You can still save the MP4.",
+    "save": "Save MP4 as…",
+    "delete": "Delete",
+    "deleteConfirm": "Delete this browser copy? This cannot be undone. Saved files will remain.",
+    "saveHint": "Save As writes to this browser’s computer. To save on a remote terminal’s computer, use bsk video save --out.",
+    "state": {
+      "starting": "Preparing recording…",
+      "recording": "Recording",
+      "finalizing": "Finishing MP4…",
+      "ready": "Ready",
+      "failed": "Recording failed"
+    },
+    "reason": {
+      "user_stopped": "Stopped by user",
+      "duration_limit": "Reached the selected duration limit",
+      "size_limit": "Reached the 256 MB file limit",
+      "tab_closed": "The recorded tab was closed",
+      "session_ended": "The task ended or released this tab",
+      "disconnected": "The browser connection ended",
+      "debugger_detached": "The recording connection was detached",
+      "capture_failed": "Page capture was interrupted",
+      "encoding_failed": "Video encoding was interrupted",
+      "storage_failed": "Browser storage could not continue",
+      "browser_restarted": "Recovered after the browser or extension restarted"
+    },
+    "agentHint": "Tell your agent to record before starting the task. It will start and stop recording for you; preview and save the result here.",
+    "manual": "Record a running task manually",
+    "copyFailed": "Could not copy the prompt. Please try again."
   }
 }
