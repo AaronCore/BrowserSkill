@@ -16,7 +16,8 @@ bsk extract list --session <id> --selector '#results' --item-selector '.result' 
 
 Choose exactly one of **--selector**, **--target** or **--ref**. A selector must
 match one container in the main document. Without these options, table/list
-extraction requires exactly one visible semantic container in that document.
+extraction requires exactly one visible semantic container in that document;
+layout containers marked role="presentation" or role="none" are ignored, as in discovery.
 Discovery searches open shadow roots and available frames, including OOPIFs.
 Use its target_id to read those containers; ordinary observation refs often
 describe controls rather than the containing table. A fresh DOM ref is also
@@ -25,7 +26,8 @@ accepted; visual-region refs are not.
 Discovery handles expire after five minutes and are scoped to the session,
 tab, attachment and frame document. Navigation, node removal or a new attachment
 invalidates them. Rediscover after such changes. Discovery is capped at 16 frames,
-32 returned targets and 8 preview headers per target; partial results are marked.
+32 returned targets and 8 preview column headers per target (row headers are
+not previewed); partial results are marked.
 A discovery selector limits the search to a subtree of the main document. Tables
 and grids take priority over lists within the visited DOM/frames. Traversal or
 time limits return the complete targets found so far. A target handle supplies
@@ -77,11 +79,20 @@ Duplicate names retain different column keys. Missing/empty headers become
 Column N; a headerless table keeps its first data row.
 Native spans use the browser's HTML parsing rules, including rowspan=0. Invalid
 ARIA spans fall back to one with invalid_aria-rowspan/invalid_aria-colspan warnings.
-ARIA rows are sorted by logical row index. Split rows sharing an explicit index
+Rows with aria-rowindex (ARIA grids and native tables) and list items with
+aria-posinset are sorted by logical position, since virtualized views may recycle
+DOM order. Invalid aria-rowindex/aria-colindex/aria-posinset/aria-setsize values
+fall back to DOM order with invalid_<attribute> warnings instead of failing.
+Split rows sharing an explicit index
 are joined only when all fragments supply explicit, non-overlapping column indices
 and agree on row kind; ambiguous/conflicting fragments fail. Reordering and merges
-are reported as aria_rows_reordered and split_aria_rows_merged. Merged row locators
-join the contributing locations with " | ". Treegrid extraction reads loaded rows;
+are reported as aria_rows_reordered and split_aria_rows_merged; list items sharing
+a position are kept in DOM order with duplicate_item_positions. Merged row locators
+join the contributing locations with " | ". A row cap still collects later
+fragments (for example pinned-column containers) of rows already accepted. If a
+budget stops collection before every fragment of an accepted row is read, that
+row is dropped and split_aria_rows_incomplete is reported, rather than returning
+its unread columns as null. Treegrid extraction reads loaded rows;
 it does not expand groups or infer an unrendered hierarchy.
 
 Hidden rows are omitted. Hidden cells, missing fields and span-covered cells
@@ -92,7 +103,9 @@ their known indices alone do not imply missing virtual rows. Locators are diagno
 selectors; ::shadow indicates a shadow boundary.
 
 Text follows open shadow roots and assigned slots, collapses ordinary template
-whitespace, and keeps BR/block boundaries and preformatted whitespace. Text-like
+whitespace, and keeps BR/block boundaries and preformatted whitespace. Content
+that is not rendered as text is skipped: SVG title/desc/defs (only SVG text
+elements contribute) and everything but the summary of a closed details element. Text-like
 inputs and textareas return live values; selects return selected option labels
 (one per line for multiple selections). Password/hidden inputs and checkbox,
 radio, file and image input values are not exported as text. This is DOM-based
@@ -118,8 +131,10 @@ declared counts and warnings before using the result for totals.
 | --timeout-ms | 5000 | 100–15000 milliseconds |
 
 These are upper bounds, not promises that every page will reach them. The collector
-also caps traversal work at 100,000 steps and header fragments at 32. Wider or
-more deeply nested content can exhaust work or byte budgets first. Row locator
+also caps traversal work in proportion to the requested shape (100,000 steps plus
+max_rows × (6 × max_columns + 48), at most 5,000,000) and header fragments at 32.
+Wider or more deeply nested content can exhaust the time or byte budget first.
+The byte budget counts emitted text, so collapsed template whitespace is free. Row locator
 sibling positions are cached so ordinary long tables do not incur quadratic scans.
 Time checking is
 cooperative inside the collector; cancellation prevents publishing a cancelled

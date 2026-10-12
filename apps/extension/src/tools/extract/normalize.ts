@@ -51,8 +51,20 @@ export function normalizeExtract(
       header_path: [],
       name_source: "field",
     }));
-    result.rows = raw.items;
-    result.row_sources = raw.item_sources;
+    // Virtual lists may recycle items out of aria-posinset order.
+    const order = raw.item_sources
+      .map((source, index) => ({ source, index }))
+      .sort((a, b) => a.source.source_row - b.source.source_row);
+    if (order.some(({ index }, position) => index !== position))
+      result.warnings.push("aria_rows_reordered");
+    if (
+      order.some(
+        ({ source }, position) => source.source_row === order[position - 1]?.source.source_row,
+      )
+    )
+      result.warnings.push("duplicate_item_positions");
+    result.rows = order.map(({ index }) => raw.items[index]);
+    result.row_sources = order.map(({ source }, row) => ({ ...source, row }));
     const indices = positions(raw.item_sources.map((row) => row.source_row));
     if (
       hasGaps(indices) ||

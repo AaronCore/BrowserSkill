@@ -44,10 +44,24 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
     textBytes += encoder.encode(value).length;
     if (textBytes > options.max_bytes) fail("extract_limit", "Text byte budget exceeded");
   };
+  // Scale traversal work with the requested table shape. A cell costs a few
+  // steps; the time budget remains the backstop for pathological documents.
+  const workLimit = Math.min(
+    5_000_000,
+    100_000 + options.max_rows * (options.max_columns * 6 + 48),
+  );
   const tick = () => {
-    if (++work > 100_000) fail("extract_limit", "DOM traversal budget exceeded");
+    if (++work > workLimit) fail("extract_limit", "DOM traversal budget exceeded");
     if (work % 64 === 0 && performance.now() - started > options.timeout_ms)
       fail("extract_limit", "DOM collection deadline exceeded");
+  };
+  const closedDetailsContent = (element: Element): boolean => {
+    const parent = element.parentElement;
+    return (
+      parent instanceof HTMLDetailsElement &&
+      !parent.open &&
+      element !== parent.querySelector(":scope > summary")
+    );
   };
   const isHidden = (node: Element): boolean => {
     const cached = hidden.get(node);
@@ -69,6 +83,7 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
         current.hasAttribute("data-bsk-overlay") ||
         current.hasAttribute("data-bsk-overlay-host") ||
         current.tagName.toLowerCase() === "browser-skill-overlay" ||
+        closedDetailsContent(current) ||
         style.display === "none" ||
         style.visibility === "hidden" ||
         style.visibility === "collapse" ||
@@ -87,31 +102,50 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
   };
   const childrenOf = (element: Element): ArrayLike<Node> => {
     if (element instanceof HTMLSlotElement) return element.assignedNodes({ flatten: true });
+    if (element instanceof HTMLDetailsElement && !element.open) {
+      const summary = element.querySelector(":scope > summary");
+      return summary ? [summary] : [];
+    }
     return element.shadowRoot?.childNodes ?? element.childNodes;
   };
+  // SVG text renders only from these elements; title, desc, defs, etc. do not.
+  const renderedSvg = new Set([
+    "svg",
+    "g",
+    "a",
+    "switch",
+    "text",
+    "tspan",
+    "textPath",
+    "foreignObject",
+  ]);
   const text = (root: Element): string => {
     if (isHidden(root)) return "";
     const pieces: string[] = [];
+    // Charge only emitted text, so collapsed template whitespace is free.
+    const push = (value: string) => {
+      consume(value);
+      pieces.push(value);
+    };
     let pendingSpace = false;
     let pendingBreak = false;
     let lineStart = true;
     const emit = (value: string) => {
       if (!value) return;
-      if (pendingBreak && !lineStart) pieces.push("\n");
-      else if (pendingSpace && !lineStart && !value.startsWith("\n")) pieces.push(" ");
+      if (pendingBreak && !lineStart) push("\n");
+      else if (pendingSpace && !lineStart && !value.startsWith("\n")) push(" ");
       pendingSpace = false;
       pendingBreak = false;
-      pieces.push(value);
+      push(value);
       lineStart = value.endsWith("\n");
     };
     const newline = () => {
-      pieces.push("\n");
+      push("\n");
       pendingBreak = false;
       pendingSpace = false;
       lineStart = true;
     };
     const append = (value: string, whiteSpace: string) => {
-      consume(value);
       if (["pre", "pre-wrap", "break-spaces"].includes(whiteSpace)) {
         emit(value.replace(/\r\n?/g, "\n"));
         return;
@@ -142,6 +176,7 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
       if (!(node instanceof Element)) continue;
       if (
         isHidden(node) ||
+        (node instanceof SVGElement && !renderedSvg.has(node.localName)) ||
         node.matches(
           'script,style,template,noscript,input[type="password"],input[type="hidden"]',
         ) ||
@@ -229,14 +264,28 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
       return fail("extract_selector_invalid", `Invalid CSS selector: ${selector}`);
     }
   };
-  const integer = (value: string | null, fallback: number, allowZero = false): number => {
-    if (value === null) return fallback;
-    if (!/^\d+$/.test(value))
-      return fail("extract_structure_invalid", "Invalid row/column index or span");
-    const number = Number(value);
-    if (!Number.isSafeInteger(number) || number < (allowZero ? 0 : 1))
-      return fail("extract_structure_invalid", "Invalid row/column index or span");
-    return number;
+  // Invalid ARIA positions fall back to DOM order with a warning, like spans
+  // and counts; only conflicting cells remain structural errors.
+  const ariaIndex = (
+    element: Element,
+    name: string,
+    fallback: number,
+  ): { value: number; explicit: boolean } => {
+    const raw = element.getAttribute(name);
+    if (raw === null) return { value: fallback, explicit: false };
+    const number = Number(raw.trim());
+    if (/^\d+$/.test(raw.trim()) && Number.isSafeInteger(number) && number >= 1)
+      return { value: number, explicit: true };
+    result.warnings.push(`invalid_${name}`);
+    return { value: fallback, explicit: false };
+  };
+  const ariaCount = (element: Element, name: string): number | undefined => {
+    const raw = element.getAttribute(name);
+    if (raw === null) return undefined;
+    const number = Number(raw.trim());
+    if (/^(-1|\d+)$/.test(raw.trim()) && Number.isSafeInteger(number)) return number;
+    result.warnings.push(`invalid_${name}`);
+    return undefined;
   };
   const locator = (element: Element): string => {
     const segments: string[] = [];
@@ -266,9 +315,7 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
   const limitReason = (error: Error, fallback: string) =>
     error.message.includes("deadline") ? "time_limit" : fallback;
   const omit = (element: Element, fallback: number, attribute: string) => {
-    const value = element.getAttribute(attribute);
-    const index = value === null ? fallback : Number(value);
-    if (Number.isSafeInteger(index) && index > 0) result.omitted_rows!.push(index);
+    result.omitted_rows!.push(ariaIndex(element, attribute, fallback).value);
     result.warnings.push("hidden_rows_omitted");
   };
   try {
@@ -307,8 +354,18 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
               const columns: string[] = [];
               for (const header of select(element, 'th,[role="columnheader"]')) {
                 if (columns.length >= 8) break;
-                if (header.closest(tableSelector) === element && !isHidden(header))
-                  columns.push(text(header));
+                if (header.closest(tableSelector) !== element || isHidden(header)) continue;
+                const role = header.getAttribute("role");
+                const scope = header.getAttribute("scope") ?? "";
+                const row = header.closest('tr,[role="row"]');
+                const columnHeader =
+                  role === "columnheader" ||
+                  (role !== "rowheader" &&
+                    !["row", "rowgroup"].includes(scope) &&
+                    (header.closest("thead") !== null ||
+                      ["col", "colgroup"].includes(scope) ||
+                      !row?.querySelector('td,[role="cell"],[role="gridcell"]')));
+                if (columnHeader) columns.push(text(header));
               }
               const caption = element instanceof HTMLTableElement ? element.caption : null;
               const label =
@@ -341,7 +398,8 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
       let selected: Element | undefined;
       for (const node of matches) {
         tick();
-        if (isHidden(node)) continue;
+        if (isHidden(node) || ["presentation", "none"].includes(node.getAttribute("role") ?? ""))
+          continue;
         if (selected)
           fail("extract_target_ambiguous", "Multiple containers found; use discover or a selector");
         selected = node;
@@ -354,12 +412,8 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
       ["aria-rowcount", "declared_rows"],
       ["aria-colcount", "declared_columns"],
     ] as const) {
-      const value = root.getAttribute(attribute);
-      if (value !== null) {
-        const count = Number(value);
-        if (Number.isSafeInteger(count) && (count === -1 || count >= 0)) result[field] = count;
-        else result.warnings.push(`invalid_${attribute}`);
-      }
+      const count = ariaCount(root, attribute);
+      if (count !== undefined) result[field] = count;
     }
     if (options.action === "list") {
       const fields = options.fields ?? [
@@ -384,12 +438,9 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
             break;
           }
           const row: Record<string, string | null> = Object.create(null);
-          const position = integer(item.getAttribute("aria-posinset"), sourceRow);
-          if (position <= (result.item_sources.at(-1)?.source_row ?? 0))
-            fail("extract_structure_invalid", "ARIA list positions must increase");
-          const setSize = item.getAttribute("aria-setsize");
-          if (setSize !== null) {
-            const count = setSize === "-1" ? -1 : integer(setSize, 0);
+          const position = ariaIndex(item, "aria-posinset", sourceRow).value;
+          const count = ariaCount(item, "aria-setsize");
+          if (count !== undefined) {
             result.declared_rows =
               result.declared_rows === undefined
                 ? count
@@ -458,7 +509,6 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
     const rows = native ? (root as HTMLTableElement).rows : select(root, '[role="row"]');
     const groups = new Map<Element | null, number>();
     let dataRows = 0;
-    let previousSourceRow = 0;
     const dataPositions = new Set<number>();
     let sawData = false;
     for (let index = 0; index < rows.length; index++) {
@@ -470,10 +520,22 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
           omit(element, index + 1, "aria-rowindex");
           continue;
         }
-        const sourceRow = integer(element.getAttribute("aria-rowindex"), index + 1);
-        if (native && sourceRow <= previousSourceRow)
-          fail("extract_structure_invalid", "ARIA row indices must increase");
-        previousSourceRow = sourceRow;
+        const position = ariaIndex(element, "aria-rowindex", index + 1);
+        const sourceRow = position.value;
+        // Recycled/virtual rows may appear in any DOM order; normalize sorts them.
+        if (position.explicit) result.aria_rows = true;
+        if (dataRows === options.max_rows && !dataPositions.has(sourceRow)) {
+          if (native) {
+            stop("row_limit");
+            break;
+          }
+          // A later rowgroup (e.g. pinned columns) may still hold fragments of
+          // accepted rows, so skip new data rows instead of stopping.
+          if (!element.querySelector('[role="columnheader"]')) {
+            stop("row_limit");
+            continue;
+          }
+        }
         const rowCells =
           element instanceof HTMLTableRowElement
             ? element.cells
@@ -504,9 +566,12 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
             ((headerGroup || cell.tagName === "TH") &&
               !["row", "rowgroup"].includes(scope) &&
               role !== "rowheader");
-          const columnIndex =
-            cell.getAttribute("aria-colindex") ??
-            (cellIndex === 0 ? element.getAttribute("aria-colindex") : null);
+          const indexSource = cell.hasAttribute("aria-colindex")
+            ? cell
+            : cellIndex === 0 && element.hasAttribute("aria-colindex")
+              ? element
+              : null;
+          const columnIndex = indexSource && ariaIndex(indexSource, "aria-colindex", 0);
           cells.push({
             text: isHidden(cell) ? null : text(cell),
             id: cell.id,
@@ -521,7 +586,7 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
                 : ariaSpan(cell, "aria-rowspan", true),
             column_span:
               cell instanceof HTMLTableCellElement ? cell.colSpan : ariaSpan(cell, "aria-colspan"),
-            ...(columnIndex !== null ? { column_index: integer(columnIndex, 1) } : {}),
+            ...(columnIndex?.explicit ? { column_index: columnIndex.value } : {}),
           });
         }
         const isHeader =
@@ -531,7 +596,8 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
             cells.every((cell) => cell.header || !cell.text));
         if (!isHeader && !dataPositions.has(sourceRow) && dataRows === options.max_rows) {
           stop("row_limit");
-          break;
+          if (native) break;
+          continue;
         }
         if (isHeader && result.rows.filter((row) => row.kind === "header").length >= 32)
           fail("extract_limit", "Header row budget exceeded");
@@ -541,7 +607,7 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
           group: groups.get(groupElement)!,
           kind: isHeader ? "header" : footerGroup ? "footer" : "data",
           locator: locator(element),
-          indexed: element.hasAttribute("aria-rowindex"),
+          indexed: position.explicit,
         };
         result.rows.push(row);
         if (!isHeader) {
@@ -551,7 +617,30 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
         }
       } catch (error) {
         if (isLimit(error) && dataRows) {
-          stop(limitReason(error, "collection_limit"));
+          if (result.stop_reason !== "row_limit") stop(limitReason(error, "collection_limit"));
+          if (!native) {
+            // Unread fragments of accepted rows (another rowgroup) would leave
+            // those rows with null columns; drop them rather than return them.
+            const unread = new Set<number>();
+            for (let next = index; next < rows.length; next++) {
+              const value = Number(rows[next].getAttribute("aria-rowindex")?.trim());
+              if (dataPositions.has(value) && rows[next].closest(tableSelector) === root)
+                unread.add(value);
+            }
+            if (unread.size) {
+              result.rows = result.rows.filter(
+                (row) => row.kind === "header" || !unread.has(row.source_row),
+              );
+              for (const value of unread) dataPositions.delete(value);
+              dataRows = dataPositions.size;
+              result.warnings.push("split_aria_rows_incomplete");
+            }
+            if (!dataRows)
+              fail(
+                "extract_limit",
+                "Split ARIA rows could not be completed within the collection budget; lower max_rows or raise max_bytes/timeout_ms",
+              );
+          }
           break;
         }
         throw error;
