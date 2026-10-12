@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { videoEncoderConfig } from "./encoder-config";
+import { VIDEO_PRESETS } from "./types";
 
 describe("video encoder configuration", () => {
+  it.each(
+    Object.entries(VIDEO_PRESETS),
+  )("keeps the %s preset's maximum square frame within level 5.0's frame-size limit", (_quality, preset) => {
+    const macroblocks = Math.ceil(preset.maxDimension / 16) ** 2;
+    expect(macroblocks).toBeLessThanOrEqual(22080);
+  });
+
   it.each([
     [1920, 1080],
     [1920, 1128],

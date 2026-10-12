@@ -198,6 +198,7 @@ export class VideoEncoderPipeline {
         });
       const config = videoEncoderConfig(bitmap.width, bitmap.height, this.recording.quality);
       const size = { width: config.width, height: config.height };
+      // Test the exact dimensions rather than treating API presence as codec availability.
       const support = await VideoEncoder.isConfigSupported(config);
       if (!support.supported)
         throw new VideoError({
