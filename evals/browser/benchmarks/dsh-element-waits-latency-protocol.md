@@ -64,3 +64,11 @@ avoids adding a mandatory reference read for an otherwise self-contained action.
 Run six exploratory pairs comparing the trim-only plugin with this scoped entry
 before the independent confirmation. No confirmation data has been collected or
 used to choose either change. The original confirmation size and gate stay fixed.
+
+Before confirmation, also normalize a benchmark confound: load each arm from the
+same experiment-owned package path and use opaque workspace IDs. The earlier
+runner exposed different checkout/arm names in skill resource paths and working
+directories. Copying happens before the task timer and between exited DSH
+processes; model-visible plugin location, dependencies and prompt structure are
+identical between arms. Preserve and report the earlier exploratory cohorts with
+their original paths; do not reinterpret them as a path-controlled comparison.

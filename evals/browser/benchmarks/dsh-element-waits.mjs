@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -55,6 +55,13 @@ assert.equal(
   "Use an empty output directory; traces are append-only",
 );
 const scratch = await mkdtemp(join(tmpdir(), "bsk-model-"));
+const pluginDirectory = join(scratch, "plugin");
+await mkdir(pluginDirectory);
+await symlink(
+  join(root, "packages/dsh-plugin-browserskill/node_modules"),
+  join(pluginDirectory, "node_modules"),
+  "dir",
+);
 const bskPath = resolve(values.cli ?? join(root, "target/release/bsk"));
 const env = { BSK_HOME: scratch, BSK_AUTO_START: "0", BSK_AUTO_UPDATE: "off" };
 const fixtureRegistry = await loadFixtureRegistry();
@@ -200,6 +207,7 @@ try {
     modes,
     cases,
     order: "Rotate the first arm each round; reverse every full rotation for three arms.",
+    pluginLocation: "Same isolated package path in every arm; opaque workspace IDs.",
     hashes: {},
   };
   for (const [label, file] of Object.entries({
@@ -292,9 +300,17 @@ try {
                     : [6000, 1500, 10000][round % 3];
             delays.set(fixtureId, delayMs);
             const tracePath = join(out, `${runId}.trace.jsonl`);
-            const workspace = join(scratch, runId);
+            const workspace = join(scratch, fixtureId);
             await mkdir(workspace);
-            const plugin = plugins[mode];
+            // Keep arm names and checkout paths out of the model's skill resource path.
+            // DSH has exited before replacing this experiment-owned package.
+            const sourcePackage = dirname(dirname(plugins[mode]));
+            for (const entry of ["lib", "skill", "package.json"]) {
+              const destination = join(pluginDirectory, entry);
+              await rm(destination, { recursive: true, force: true });
+              await cp(join(sourcePackage, entry), destination, { recursive: true });
+            }
+            const plugin = join(pluginDirectory, "lib/index.mjs");
             let configuredCli = bskPath;
             if (scenario === "unsupported") {
               configuredCli = join(workspace, "legacy-cli.mjs");
