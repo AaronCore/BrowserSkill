@@ -251,6 +251,12 @@ jobs:
           BSK_CLICK_CHROME: google-chrome
         run: pnpm exec vitest run src/tools/__tests__/emulation-lifecycle.browser.test.ts
 
+      - name: Run structured extraction browser regression
+        working-directory: apps/extension
+        env:
+          BSK_CLICK_CHROME: google-chrome
+        run: pnpm exec vitest run src/tools/extract/extract.browser.test.ts
+
       - name: Run fill browser regression
         working-directory: apps/extension
         env:
