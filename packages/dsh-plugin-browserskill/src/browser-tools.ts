@@ -142,11 +142,11 @@ const BROWSER_TOOL_SPECS: BrowserToolSpec[] = [
   {
     name: "browser_page",
     description:
-      "Navigate and wait on the active Agent Window tab. Actions: navigate, back, forward, reload, " +
-      "wait, wait-for-element. navigate requires url; reload optionally accepts hard; navigation " +
-      "actions accept waitUntil/timeoutMs. wait-for-element requires target: use only for an " +
-      "observed pending condition; skip if already ready. Its timeoutMs defaults to 10000 (max " +
-      "300000); satisfied=false means timeout. Observe again " +
+      "Navigate and wait on the active Agent Window tab. navigate requires url; reload optionally " +
+      "accepts hard. Navigation and wait use waitUntil/timeoutMs. For an observed pending dynamic " +
+      "update, use wait-for-element instead of sleep, lifecycle wait or repeated observations; " +
+      "skip if already ready. It requires target; prefer an existing fresh ref over fetching HTML " +
+      "for a selector. Its timeoutMs defaults to 10000 (max 300000); satisfied=false means timeout. Observe again " +
       "after a meaningful page change before reusing refs.",
     actions: {
       navigate: "page.navigate",

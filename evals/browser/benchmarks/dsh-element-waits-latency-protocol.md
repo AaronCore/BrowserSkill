@@ -72,3 +72,22 @@ directories. Copying happens before the task timer and between exited DSH
 processes; model-visible plugin location, dependencies and prompt structure are
 identical between arms. Preserve and report the earlier exploratory cohorts with
 their original paths; do not reinterpret them as a path-controlled comparison.
+
+## Second revision after a rejected confirmation
+
+The first 40 pairs all completed, but the latency ratio's upper bound was 1.0517,
+above 1.05. Its 24 dynamic tasks also exposed a guidance regression: the shortened
+schema omitted the distinction between dynamic element conditions and lifecycle
+waiting, and omitted preferring an existing ref over additional HTML lookups.
+Several tasks used sleeps, lifecycle waits or repeated HTML inspection while an
+update was pending. Preserve these failed-version data and do not change their
+gate. Recovery trials on this rejected instruction version are not pursued.
+
+Restore those two choices directly in the action description, removing the
+duplicated action-name list (already in the enum) to keep the schema compact.
+Keep main's skill entry and all execution code unchanged. Freeze this revision
+before running a new, independent set of 40 static pairs, six pairs per dynamic
+workload and three candidate trials per recovery condition. Use the same path
+controls, model, alternating order, 5% bound and correctness gates. Label every
+new cohort `latency-revised-*`; never pool it with the first confirmation. A
+second inconclusive result leaves the PR in draft; do not keep tuning to a pass.
