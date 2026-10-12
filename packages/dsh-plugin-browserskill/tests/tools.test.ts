@@ -1924,7 +1924,7 @@ describe("structured extraction", () => {
           extractKind: "table",
           extractTarget: "xt_fixture",
           extractFormat: "csv",
-          extractOutput: "/tmp/results.csv",
+          output: "/tmp/results.csv",
           csvSafe: true,
         },
         makeExec(),

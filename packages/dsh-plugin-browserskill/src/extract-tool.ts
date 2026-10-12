@@ -34,11 +34,12 @@ export const EXTRACT_PARAMETERS = {
   extractFormat: {
     type: "string",
     enum: ["json", "csv"],
-    description: "JSON by default. CSV requires extractOutput and also writes a metadata sidecar.",
+    description: "JSON by default. CSV requires output and also writes a metadata sidecar.",
   },
-  extractOutput: {
+  output: {
     type: "string",
-    description: "Optional new file on the CLI host; returns a receipt instead of all rows.",
+    description:
+      "Extract: optional new JSON/CSV file on the CLI host; returns a receipt instead of all rows.",
   },
   csvSafe: {
     type: "boolean",
@@ -84,8 +85,8 @@ export function registerExtractTool(
             .length > 1
         )
           throw new Error("selector, extractTarget and ref are mutually exclusive");
-        if (args.extractFormat === "csv" && !args.extractOutput)
-          throw new Error("CSV extraction requires extractOutput");
+        if (args.extractFormat === "csv" && !args.output)
+          throw new Error("CSV extraction requires output");
         if (args.extractFields !== undefined) {
           const value = JSON.parse(args.extractFields);
           if (!value || !Array.isArray(value.fields))
@@ -105,7 +106,7 @@ export function registerExtractTool(
           [args.maxBytes, "--max-bytes"],
           [args.extractTimeoutMs, "--timeout-ms"],
           [args.extractFormat, "--format"],
-          [args.extractOutput, "--out"],
+          [args.output, "--out"],
         ] as const)
           if (value !== undefined) command.push(flag, String(value));
         if (args.csvSafe) command.push("--csv-safe");

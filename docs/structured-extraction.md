@@ -166,7 +166,7 @@ The existing **browser_inspect** tool gains **action: "extract"**:
 browser_inspect({ action: "extract", session: "<id>", extractKind: "discover" })
 browser_inspect({ action: "extract", session: "<id>", extractKind: "table", extractTarget: "<target_id>" })
 browser_inspect({ action: "extract", session: "<id>", extractKind: "table", selector: "#orders",
-  extractFormat: "csv", extractOutput: "/absolute/path/orders.csv", csvSafe: true })
+  extractFormat: "csv", output: "/absolute/path/orders.csv", csvSafe: true })
 ~~~
 
 List extraction uses itemSelector and the fields-object JSON string in
@@ -175,6 +175,10 @@ output path so the plugin always receives structured JSON. The plugin uses the
 normal session registry, runner and queue; it does not introduce arbitrary
 page-script evaluation. Output paths are on the CLI host; relative paths resolve
 against that process's working directory. Prefer absolute paths in harness calls.
+Extraction shares browser_inspect's output parameter with debug export and video
+save. Its model guidance lives in the browser_inspect description and parameter
+schema rather than a separate DSH skill reference, keeping the DSH skill entry
+within its 4,500-byte budget in both LF and CRLF checkouts.
 
 ## Implementation
 
