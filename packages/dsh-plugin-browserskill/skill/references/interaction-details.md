@@ -2,7 +2,8 @@
 
 ## Element waits
 
-Wait only when the latest observation shows a pending update. For example, if
+`browser_page` supports `action: "wait-for-element"` for an explicit element
+condition. For example, if
 `@e2` is an observed loading indicator after the triggering action, use
 `browser_page({ action: "wait-for-element", target: "@e2", state: "hidden" })`,
 then check `satisfied` and observe the result. Replace the example ref with the
@@ -49,5 +50,5 @@ Continuation uses the same capture without refresh/depth changes. New
 observe/snapshot or changed page identity invalidates it.
 
 Console/network are bounded read-only diagnostics; follow sequence cursors.
-Use lifecycle `wait` only for expected navigation, not dynamic content.
-`browser_assist` resizes windows or emulates a device for one tab.
+Wait only for expected navigation. `browser_assist` resizes windows or emulates
+a device for one tab.
