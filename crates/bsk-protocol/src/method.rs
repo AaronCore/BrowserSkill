@@ -21,6 +21,8 @@ pub enum MethodEffect {
 /// Namespaced method string (`system.handshake`, `tool.tab_list`, …).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Method {
+    #[serde(rename = "tool.video")]
+    ToolVideo,
     /// Extension-only local history API; browser identity comes from the peer.
     #[serde(rename = "audit.request")]
     AuditRequest,
@@ -124,6 +126,8 @@ pub enum Method {
     ToolEvaluate,
     #[serde(rename = "tool.wait_for_navigation")]
     ToolWaitForNavigation,
+    #[serde(rename = "tool.wait_for_element")]
+    ToolWaitForElement,
     #[serde(rename = "tool.wait_ms")]
     ToolWaitMs,
     #[serde(rename = "tool.request_help")]
@@ -225,6 +229,7 @@ impl Method {
             | Method::ToolConsole
             | Method::ToolNetwork
             | Method::ToolWaitForNavigation
+            | Method::ToolWaitForElement
             | Method::ToolWaitMs
             | Method::ToolRequestHelp
             | Method::ToolRecordStop
@@ -242,6 +247,7 @@ impl Method {
 
             // System / control — not gated.
             Method::ToolDebug
+            | Method::ToolVideo
             | Method::AuditRequest
             | Method::SystemHandshake
             | Method::SystemPing
@@ -261,6 +267,8 @@ impl Method {
     /// network interventions and replay are gated like other browser writes.
     pub fn requires_interrupt_gate_with_params(&self, params: &serde_json::Value) -> bool {
         self.requires_interrupt_gate()
+            || (matches!(self, Method::ToolVideo)
+                && params.get("action").and_then(|value| value.as_str()) == Some("start"))
             || (matches!(self, Method::ToolDebug)
                 && matches!(
                     params.get("action").and_then(|value| value.as_str()),
@@ -287,6 +295,28 @@ mod tests {
     use super::*;
     use crate::{CancelParams, CancelResult};
     use serde_json::json;
+
+    #[test]
+    fn video_start_respects_interrupts_but_teardown_and_artifact_reads_remain_available() {
+        assert!(
+            super::Method::ToolVideo
+                .requires_interrupt_gate_with_params(&serde_json::json!({"action":"start"}))
+        );
+        for action in [
+            "capabilities",
+            "list",
+            "status",
+            "stop",
+            "read",
+            "exported",
+            "discard",
+        ] {
+            assert!(
+                !super::Method::ToolVideo
+                    .requires_interrupt_gate_with_params(&serde_json::json!({"action": action}))
+            );
+        }
+    }
 
     #[test]
     fn cancel_method_round_trips() {
@@ -375,6 +405,7 @@ mod tests {
         assert!(!Method::ToolConsole.is_mutating());
         assert!(!Method::ToolNetwork.is_mutating());
         assert!(!Method::ToolWaitForNavigation.is_mutating());
+        assert!(!Method::ToolWaitForElement.is_mutating());
         assert!(!Method::ToolWaitMs.is_mutating());
     }
 

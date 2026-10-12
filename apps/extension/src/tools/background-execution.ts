@@ -39,6 +39,7 @@ const pageTools = new Set([
   "tool.download",
   "tool.emulate",
   "tool.wait_for_navigation",
+  "tool.wait_for_element",
   "tool.screenshot_full_page",
 ]);
 
