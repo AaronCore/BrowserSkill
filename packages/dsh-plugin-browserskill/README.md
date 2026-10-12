@@ -211,6 +211,14 @@ The [Release dsh plugin workflow](https://github.com/Tencent/BrowserSkill/blob/m
 publishes the package and this README to npm. Pushing a `dsh-plugin-vX.Y.Z` tag
 triggers it; ordinary commits to `main` do not.
 
+Before publishing the plugin with `wait-for-element`, publish compatible CLI
+and extension builds containing [#407](https://github.com/Tencent/BrowserSkill/pull/407).
+The `cli-v0.3.0`, `cli-v0.3.1`, and `cli-v0.3.2` releases do not include this
+command. Confirm the compatible CLI and extension release artifacts are available
+before pushing the plugin tag; publishing the npm package alone does not upgrade
+either component on users' machines. Older installations can still use the
+[single-action recovery path](skill/references/interaction-details.md#element-waits).
+
 1. Commit this README and any other changes intended for the release.
 2. From the repository root, run the
    [release script](https://github.com/Tencent/BrowserSkill/blob/main/scripts/release.mjs)
@@ -231,7 +239,7 @@ triggers it; ordinary commits to `main` do not.
    ```
 
    This publishes the DSH plugin. Push the CLI and extension tags separately when
-   those components are ready for release.
+   those components are ready for release, respecting the compatibility order above.
 
 The workflow checks the version, runs typechecks and tests, builds the package,
 and publishes it to npm.

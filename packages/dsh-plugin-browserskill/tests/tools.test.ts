@@ -1094,20 +1094,32 @@ describe("page.wait-for-element", () => {
   });
 
   it.each([
-    {},
-    { target: "" },
-    { target: "  " },
-    { target: "#x", state: "enabled" },
-    { target: "#x", timeoutMs: 0 },
-    { target: "#x", timeoutMs: 300_001 },
-    { target: "#x", timeoutMs: 1.5 },
-    { target: "#x", pollMs: 15 },
-    { target: "#x", pollMs: 2001 },
-    { target: "#x", pollMs: 100.5 },
-  ])("rejects invalid element wait arguments before running the CLI: %j", async (args) => {
-    const { tools, calls } = setup({});
-    await expect(tools.get("page.wait-for-element")!.execute(args, makeExec())).rejects.toThrow();
-    expect(calls).toEqual([]);
+    { args: {}, message: /invalid arguments/i },
+    { args: { target: "" }, message: "target must be a non-empty string" },
+    { args: { target: "  " }, message: "target must be a non-empty string" },
+    { args: { target: "#x", state: "enabled" }, message: /invalid arguments/i },
+    {
+      args: { target: "#x", timeoutMs: 0 },
+      message: "timeoutMs must be in 1..300000 for wait-for-element",
+    },
+    {
+      args: { target: "#x", timeoutMs: 300_001 },
+      message: "timeoutMs must be in 1..300000 for wait-for-element",
+    },
+    { args: { target: "#x", timeoutMs: 1.5 }, message: /invalid arguments/i },
+    { args: { target: "#x", pollMs: 15 }, message: "pollMs must be in 16..2000" },
+    { args: { target: "#x", pollMs: 2001 }, message: "pollMs must be in 16..2000" },
+    { args: { target: "#x", pollMs: 100.5 }, message: /invalid arguments/i },
+  ])("rejects invalid element wait arguments before running the CLI: $args", async ({
+    args,
+    message,
+  }) => {
+    const { tools, calls } = setup({ "session start": START_REPLY("s1") });
+    await startSession(tools);
+    await expect(tools.get("page.wait-for-element")!.execute(args, makeExec())).rejects.toThrow(
+      message,
+    );
+    expect(calls).toHaveLength(1);
   });
 
   it.each([
