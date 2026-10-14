@@ -125,6 +125,7 @@ const ACTION_ROUTES: Record<string, readonly [string, string]> = {
   "inspect.console": ["browser_inspect", "console"],
   "inspect.network": ["browser_inspect", "network"],
   "inspect.debug": ["browser_inspect", "debug"],
+  "inspect.extract": ["browser_inspect", "extract"],
   "interact.click": ["browser_interact", "click"],
   "interact.hover": ["browser_interact", "hover"],
   "interact.wheel": ["browser_interact", "wheel"],
@@ -237,6 +238,7 @@ const EXPECTED_ACTIONS = {
     "network",
     "debug",
     "video",
+    "extract",
   ],
   browser_interact: [
     "click",
@@ -1861,6 +1863,124 @@ it("forwards screenshot-bound Canvas coordinates to click", async () => {
     "shift",
     "e1",
   ]);
+});
+
+describe("structured extraction", () => {
+  it("routes field selectors and literal data without shell interpolation", async () => {
+    const answer = {
+      schema_version: 1,
+      rows: [{ title: "结果" }],
+      coverage: { scope: "loaded_dom" },
+    };
+    const { tools, calls } = setup({ "session start": START_REPLY("s1"), "extract list": answer });
+    await startSession(tools);
+    const fields = JSON.stringify({
+      fields: [{ key: "title", selector: '[data-value="$(literal)"]', read: "text" }],
+    });
+    const result = await tools.get("browser_inspect")!.execute(
+      {
+        action: "extract",
+        extractKind: "list",
+        selector: "#results",
+        itemSelector: ".result",
+        extractFields: fields,
+        maxRows: 20,
+        maxBytes: 2048,
+        tabId: 7,
+      },
+      makeExec(),
+    );
+    expect(result).toEqual(answer);
+    expect(calls.at(-1)?.args).toEqual([
+      "extract",
+      "list",
+      "--session",
+      "s1",
+      "--tab-id",
+      "7",
+      "--selector",
+      "#results",
+      "--item-selector",
+      ".result",
+      "--fields-json",
+      fields,
+      "--max-rows",
+      "20",
+      "--max-bytes",
+      "2048",
+    ]);
+  });
+  it("routes discovered targets and CSV receipts through the existing tool", async () => {
+    const receipt = { path: "/tmp/results.csv", metadata_path: "/tmp/results.csv.meta.json" };
+    const { tools, calls } = setup({
+      "session start": START_REPLY("s1"),
+      "extract table": receipt,
+    });
+    await startSession(tools);
+    expect(
+      await tools.get("browser_inspect")!.execute(
+        {
+          action: "extract",
+          extractKind: "table",
+          extractTarget: "xt_fixture",
+          extractFormat: "csv",
+          output: "/tmp/results.csv",
+          csvSafe: true,
+        },
+        makeExec(),
+      ),
+    ).toEqual(receipt);
+    expect(calls.at(-1)?.args).toEqual([
+      "extract",
+      "table",
+      "--session",
+      "s1",
+      "--target",
+      "xt_fixture",
+      "--format",
+      "csv",
+      "--out",
+      "/tmp/results.csv",
+      "--csv-safe",
+    ]);
+  });
+  it("bounds rows returned inline but not rows written to a file", async () => {
+    const { tools, calls } = setup({
+      "session start": START_REPLY("s1"),
+      "extract table": { schema_version: 1, rows: [] },
+    });
+    await startSession(tools);
+    const inspect = tools.get("browser_inspect")!;
+    await inspect.execute({ action: "extract", extractKind: "table", selector: "#t" }, makeExec());
+    expect(calls.at(-1)?.args).toEqual([
+      "extract",
+      "table",
+      "--session",
+      "s1",
+      "--selector",
+      "#t",
+      "--max-bytes",
+      "262144",
+    ]);
+    await inspect.execute(
+      { action: "extract", extractKind: "table", selector: "#t", output: "/tmp/t.json" },
+      makeExec(),
+    );
+    expect(calls.at(-1)?.args).not.toContain("--max-bytes");
+  });
+  it.each([
+    { selector: "#table", extractTarget: "xt_fixture" },
+    { extractFormat: "csv" },
+    { extractFields: '{"fields":"wrong"}' },
+  ])("rejects invalid extraction options before invoking CLI: %j", async (args) => {
+    const { tools, calls } = setup({ "session start": START_REPLY("s1") });
+    await startSession(tools);
+    const count = calls.length;
+    await expect(
+      tools.get("browser_inspect")!.execute({ action: "extract", ...args }, makeExec()),
+    ).rejects.toThrow();
+    expect(calls).toHaveLength(count);
+  });
 });
 
 describe("website debug", () => {
