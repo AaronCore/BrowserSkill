@@ -51,11 +51,11 @@ class GitHub:
         require(self.token and not self.token.startswith('${'), 'GH_TOKEN was not resolved from the CI credential store')
         self.opener = build_opener(SafeRedirect())
 
-    def request(self, path, method='GET', data=None, binary=False):
+    def request(self, path, method='GET', data=None, binary=False, accept=None):
         url = path if path.startswith('https://') else f'https://api.github.com/repos/{REPO}/{path}'
         require(urlparse(url).hostname in ('api.github.com', 'uploads.github.com'), 'Unexpected GitHub API host')
         headers = {'Authorization': f'Bearer {self.token}', 'User-Agent': 'BrowserSkill-release',
-                   'Accept': 'application/octet-stream' if binary else 'application/vnd.github+json',
+                   'Accept': accept or 'application/vnd.github+json',
                    'X-GitHub-Api-Version': '2022-11-28'}
         if isinstance(data, dict):
             data = json.dumps(data).encode()
@@ -255,7 +255,7 @@ def return_signed(args, api):
     # The manifest is the completion marker. Never change an already completed handoff.
     existing = next((a for a in api.assets(release) if a['name'] == json_name), None)
     if existing:
-        manifest = json.loads(api.request(f'releases/assets/{existing["id"]}', binary=True))
+        manifest = json.loads(api.request(f'releases/assets/{existing["id"]}', binary=True, accept='application/octet-stream'))
         require(all(manifest.get(k) == v for k, v in state.items()), 'Existing signing handoff belongs to another build')
         print('Signing handoff already exists; rerun the GitHub publish workflow if needed.')
         return
@@ -282,10 +282,10 @@ def collect(args, api):
         require(time.monotonic() < deadline, 'Timed out waiting for the internal signing pipeline; no release was published')
         print('Waiting for the internal Windows signing result...', flush=True)
         time.sleep(15)
-    manifest = json.loads(api.request(f'releases/assets/{assets[json_name]["id"]}', binary=True))
+    manifest = json.loads(api.request(f'releases/assets/{assets[json_name]["id"]}', binary=True, accept='application/octet-stream'))
     for key, value in state.items():
         require(manifest.get(key) == value, f'Signing result {key} mismatch')
-    signed = api.request(f'releases/assets/{assets[exe_name]["id"]}', binary=True)
+    signed = api.request(f'releases/assets/{assets[exe_name]["id"]}', binary=True, accept='application/octet-stream')
     require(digest(signed) == manifest.get('signed_sha256'), 'Signed executable SHA256 mismatch')
     same_executable(unsigned, signed)
     Path('signed').mkdir(exist_ok=True)

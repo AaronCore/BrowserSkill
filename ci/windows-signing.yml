@@ -7,6 +7,21 @@ version: v3.0
 name: BrowserSkill Windows signing
 on:
   manual: enabled
+variables:
+  release_tag:
+    value: ''
+    allow-modify-at-startup: true
+    props:
+      type: vuex-input
+      description: CLI release tag for manual recovery (cli-v<version>)
+      required: false
+  source_run_id:
+    value: ''
+    allow-modify-at-startup: true
+    props:
+      type: vuex-input
+      description: Exact successful GitHub Release CLI run ID for manual recovery
+      required: false
 stages:
 - name: Sign Windows release
   jobs:
@@ -24,6 +39,9 @@ stages:
         id: prepare
         uses: linuxScript@1.*
         timeout-minutes: 65
+        env:
+          BSK_MANUAL_TAG: "${{variables.release_tag}}"
+          BSK_SOURCE_RUN_ID: "${{variables.source_run_id}}"
         with:
           script: |
             #!/usr/bin/env bash
@@ -35,13 +53,13 @@ stages:
             curl --fail --silent --show-error --location --retry 3 --max-time 180 \
               "https://raw.githubusercontent.com/Tencent/BrowserSkill/$SCRIPT_COMMIT/scripts/windows-release.py" \
               --output windows-release.py
-            export BSK_RELEASE_TAG="${BK_CI_REPO_GITHUB_WEBHOOK_CREATE_REF_NAME:-${release_tag:-}}"
+            export BSK_RELEASE_TAG="${BK_CI_REPO_GITHUB_WEBHOOK_CREATE_REF_NAME:-${BSK_MANUAL_TAG:-}}"
             if [[ -n "${BK_CI_REPO_GITHUB_WEBHOOK_CREATE_REF_TYPE:-}" && "$BK_CI_REPO_GITHUB_WEBHOOK_CREATE_REF_TYPE" != tag ]]; then
               echo 'Only tag creation events may request signing'
               exit 1
             fi
             args=(prepare --timeout 3600)
-            if [[ -n "${source_run_id:-}" ]]; then args+=(--run-id "$source_run_id"); fi
+            if [[ -n "${BSK_SOURCE_RUN_ID:-}" ]]; then args+=(--run-id "$BSK_SOURCE_RUN_ID"); fi
             python3 windows-release.py "${args[@]}"
       - name: Windows EV signing
         id: sign

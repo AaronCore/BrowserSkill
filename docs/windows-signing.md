@@ -14,11 +14,11 @@ Import [the BK-CI template](../ci/windows-signing.yml) into the internal project
 
 Create a GitHub release credential of type Access Token in that project. It needs Actions read and Contents write for this repository. A fine-grained token works when organization policy and membership permit it. Outside collaborators may need a classic token with `public_repo` for this public repository; that scope also covers other public repositories the account can access. A dedicated GitHub App is an alternative for long-lived organization credentials. Keep token values in the credential store only, and renew expiring credentials.
 
-Replace `REVIEWED_COMMIT_SHA` with the exact reviewed deployment commit, not a moving branch. Add two optional String input variables in the BK-CI UI: `release_tag` and `source_run_id`. They are used for manual recovery; automated tag events supply the tag through `BK_CI_REPO_GITHUB_WEBHOOK_CREATE_REF_NAME`.
+Replace `REVIEWED_COMMIT_SHA` with the exact reviewed deployment commit, not a moving branch. The template provides two optional String inputs: `release_tag` and `source_run_id`. They are used for manual recovery; automated tag events supply the tag through `BK_CI_REPO_GITHUB_WEBHOOK_CREATE_REF_NAME`.
 
 Associate `Tencent/BrowserSkill` with the project and grant the standard **Tencent Blueking DevOps** GitHub App access to the repository. After importing the pipeline YAML, use the UI to add a **GitHub event trigger**, choose **Create Branch Or Tag**, and include only `cli-v*`. Publish from the UI. Some internal versions drop CREATE events when converting UI configuration back to YAML; do not switch modes after adding this trigger. Branch creation events are rejected by the signing script even if their name matches.
 
-The Bash plugin resolves the credential expression in its script; the template disables command tracing before exporting it. Step-level environment expressions were not resolved by the tested internal deployment. Keep signing credentials confined to the signing step. The GitHub credential is available only to the preparation and return steps. Do not enable pull-request triggers or use failure-continue on any step.
+The Bash plugin resolves the credential expression in its script; the template disables command tracing before exporting it. Step-level credential expressions were not resolved by the tested internal deployment; ordinary input variables are passed as step environment variables. Keep signing credentials confined to the signing step. The GitHub credential is available only to the preparation and return steps. Do not enable pull-request triggers or use failure-continue on any step.
 
 ## Release and recovery
 

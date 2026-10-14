@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import struct
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from urllib.request import Request
 import zipfile
 
@@ -18,6 +18,18 @@ class ReleaseTests(unittest.TestCase):
         return dict({'id': 123, 'run_attempt': 2, 'head_repository': {'full_name': release.REPO},
                      'path': release.WORKFLOW, 'head_sha': 'a' * 40, 'head_branch': 'cli-v1.2.3',
                      'event': 'push', 'status': 'completed', 'conclusion': 'success'}, **changes)
+
+    def test_artifact_and_release_downloads_use_their_required_media_types(self):
+        with patch.dict('os.environ', {'GH_TOKEN': 'test'}):
+            api = release.GitHub()
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'binary'
+        api.opener = MagicMock()
+        api.opener.open.return_value = response
+        api.request('actions/artifacts/1/zip', binary=True)
+        self.assertEqual(api.opener.open.call_args.args[0].get_header('Accept'), 'application/vnd.github+json')
+        api.request('releases/assets/1', binary=True, accept='application/octet-stream')
+        self.assertEqual(api.opener.open.call_args.args[0].get_header('Accept'), 'application/octet-stream')
 
     def test_source_identity_and_success_are_required(self):
         release.validate_run(self.run_record(), 'cli-v1.2.3', 'a' * 40, 2)
