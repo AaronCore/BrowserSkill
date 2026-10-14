@@ -32,6 +32,9 @@ A discovery selector limits the search to a subtree of the main document. Tables
 and grids take priority over lists within the visited DOM/frames. Traversal or
 time limits return the complete targets found so far. A target handle supplies
 its original tab when --tab-id is omitted; an explicit different tab is rejected.
+Discovery and extraction check the embedding iframe and its ancestors, including
+outer frames. Hiding a frame after discovery makes its retained targets return
+extract_target_hidden until the frame becomes visible again.
 
 Fields files (or **--fields-json** with the same object) contain:
 
@@ -101,6 +104,14 @@ content can be read. Script/style/template content, password inputs and
 BrowserSkill overlays are excluded. Hidden rows produce hidden_rows_omitted;
 their known indices alone do not imply missing virtual rows. Locators are diagnostic, not durable
 selectors; ::shadow indicates a shadow boundary.
+Default row positions count only rows belonging to the selected table/grid,
+including its hidden rows; nested grids do not consume outer row positions.
+Explicit aria-rowindex values remain authoritative.
+
+An ancestor's visibility:hidden does not discard descendants that restore
+visibility:visible. Their visible text and controls are retained, while the
+ancestor's hidden text is omitted. display:none, zero opacity and collapsed
+table rows still suppress their subtrees.
 
 Text follows open shadow roots and assigned slots, collapses ordinary template
 whitespace, and keeps BR/block boundaries and preformatted whitespace. Content

@@ -1,5 +1,5 @@
 import { ChromiumCdp } from "@/browser-driver/chromium-cdp";
-import type { CdpFrame, CdpTarget } from "@/browser-driver/frame-graph";
+import type { CdpFrame, CdpFrameGraph, CdpTarget } from "@/browser-driver/frame-graph";
 import type { SessionContext, SessionManager } from "@/session-manager/manager";
 import type { RpcError } from "@/transport/types";
 import { collectExtractDom } from "./extract/collector";
@@ -173,6 +173,64 @@ async function capture(
   }
 }
 
+/** Runs on each embedding element, in its parent's isolated world. */
+function frameOwnerVisible(this: Element): boolean {
+  if (!this.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
+  let element: Element | null = this;
+  while (element) {
+    if (
+      element.hasAttribute("hidden") ||
+      element.hasAttribute("data-bsk-overlay") ||
+      element.hasAttribute("data-bsk-overlay-host") ||
+      element.tagName.toLowerCase() === "browser-skill-overlay"
+    )
+      return false;
+    element =
+      element.assignedSlot ??
+      element.parentElement ??
+      ((element.getRootNode() as ShadowRoot).host || null);
+  }
+  return true;
+}
+
+async function frameVisible(
+  cdp: CdpRunner,
+  graph: CdpFrameGraph,
+  frame: CdpFrame,
+  attachmentId: string,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const visited = new Set<string>();
+  while (frame.frameId !== graph.rootFrameId) {
+    if (visited.has(frame.frameId)) stale();
+    visited.add(frame.frameId);
+    if (performance.now() >= deadline)
+      throw new ExtractionFailure("extract_limit", "Extraction deadline exceeded");
+    const parent = graph.frames.find((candidate) => candidate.frameId === frame.parentFrameId);
+    if (!parent || frame.ownerBackendNodeId === undefined) stale();
+    const { identity } = await documentIdentity(cdp, parent, attachmentId);
+    const owner = await resolveVerifiedNode(cdp, identity, frame.ownerBackendNodeId, signal);
+    if (owner.status !== "current") stale();
+    try {
+      const visible = unwrap(
+        await sendToCdpTarget<RuntimeReply>(cdp, parent.target, "Runtime.callFunctionOn", {
+          objectId: owner.objectId,
+          functionDeclaration: frameOwnerVisible.toString(),
+          returnByValue: true,
+        }),
+      );
+      if (visible !== true) return false;
+    } finally {
+      await sendToCdpTarget(cdp, parent.target, "Runtime.releaseObjectGroup", {
+        objectGroup: owner.objectGroup,
+      }).catch(() => {});
+    }
+    frame = parent;
+  }
+  return true;
+}
+
 export interface ExtractDeps {
   cdp: CdpRunner;
   tabsApi: ChromeTabsApi;
@@ -274,6 +332,21 @@ export async function handleExtract(
     for (const frame of frames) {
       check();
       try {
+        // A child document's styles cannot reveal that its embedding iframe
+        // (or an outer frame) is hidden. Recheck even for retained targets.
+        if (
+          !(await frameVisible(
+            cdp,
+            graph!,
+            frame,
+            attachmentId,
+            started + options.timeout_ms,
+            signal,
+          ))
+        ) {
+          if (options.action === "discover") continue;
+          throw new ExtractionFailure("extract_target_hidden", "The extraction frame is hidden");
+        }
         const remaining = options.timeout_ms - (performance.now() - started);
         if (remaining <= 0)
           throw new ExtractionFailure("extract_limit", "Extraction deadline exceeded");

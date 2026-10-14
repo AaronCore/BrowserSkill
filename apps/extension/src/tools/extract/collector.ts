@@ -24,7 +24,7 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
   const encoder = new TextEncoder();
   const tableSelector = 'table,[role="table"],[role="grid"],[role="treegrid"]';
   const listSelector = 'ul,ol,[role="list"]';
-  const hidden = new WeakMap<Element, boolean>();
+  const hiddenSubtrees = new WeakMap<Element, boolean>();
   const styles = new WeakMap<Element, CSSStyleDeclaration>();
   const styleOf = (element: Element) => {
     let style = styles.get(element);
@@ -63,15 +63,15 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
       element !== parent.querySelector(":scope > summary")
     );
   };
-  const isHidden = (node: Element): boolean => {
-    const cached = hidden.get(node);
+  const isSubtreeHidden = (node: Element): boolean => {
+    const cached = hiddenSubtrees.get(node);
     if (cached !== undefined) return cached;
     const chain: Element[] = [];
     let current: Element | null = node;
     let value = false;
     while (current) {
       tick();
-      const known = hidden.get(current);
+      const known = hiddenSubtrees.get(current);
       if (known !== undefined) {
         value = known;
         break;
@@ -85,8 +85,10 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
         current.tagName.toLowerCase() === "browser-skill-overlay" ||
         closedDetailsContent(current) ||
         style.display === "none" ||
-        style.visibility === "hidden" ||
-        style.visibility === "collapse" ||
+        (style.visibility === "collapse" &&
+          /^table-(row|row-group|header-group|footer-group|column|column-group)$/.test(
+            style.display,
+          )) ||
         style.opacity === "0"
       ) {
         value = true;
@@ -97,7 +99,7 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
         current.parentElement ??
         ((current.getRootNode() as ShadowRoot).host || null);
     }
-    for (const item of chain) hidden.set(item, value);
+    for (const item of chain) hiddenSubtrees.set(item, value);
     return value;
   };
   const childrenOf = (element: Element): ArrayLike<Node> => {
@@ -107,6 +109,41 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
       return summary ? [summary] : [];
     }
     return element.shadowRoot?.childNodes ?? element.childNodes;
+  };
+  const isVisibilityHidden = (element: Element): boolean =>
+    ["hidden", "collapse"].includes(styleOf(element).visibility);
+  const hiddenContent = new WeakMap<Element, boolean>();
+  const isHidden = (root: Element): boolean => {
+    const known = hiddenContent.get(root);
+    if (known !== undefined) return known;
+    // Unlike display:none, visibility can be restored by descendants. Keep a
+    // container when any of its composed descendants can still render.
+    const stack: { element: Element; exit?: boolean }[] = [{ element: root }];
+    while (stack.length) {
+      const { element, exit } = stack.pop()!;
+      if (hiddenContent.has(element)) continue;
+      tick();
+      if (isSubtreeHidden(element)) {
+        hiddenContent.set(element, true);
+        continue;
+      }
+      if (!isVisibilityHidden(element)) {
+        hiddenContent.set(element, false);
+        continue;
+      }
+      const children = childrenOf(element);
+      if (exit) {
+        let hidden = true;
+        for (let index = 0; index < children.length; index++)
+          if (hiddenContent.get(children[index] as Element) === false) hidden = false;
+        hiddenContent.set(element, hidden);
+        continue;
+      }
+      stack.push({ element, exit: true });
+      for (let index = children.length - 1; index >= 0; index--)
+        if (children[index] instanceof Element) stack.push({ element: children[index] as Element });
+    }
+    return hiddenContent.get(root)!;
   };
   // SVG text renders only from these elements; title, desc, defs, etc. do not.
   const renderedSvg = new Set([
@@ -120,7 +157,7 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
     "foreignObject",
   ]);
   const text = (root: Element): string => {
-    if (isHidden(root)) return "";
+    if (isSubtreeHidden(root)) return "";
     const pieces: string[] = [];
     // Charge only emitted text, so collapsed template whitespace is free.
     const push = (value: string) => {
@@ -159,10 +196,12 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
         if (collapsed.endsWith(" ")) pendingSpace = true;
       }
     };
-    type TextVisit = { node: Node; whiteSpace: string; exit?: boolean };
-    const stack: TextVisit[] = [{ node: root, whiteSpace: styleOf(root).whiteSpace }];
+    type TextVisit = { node: Node; whiteSpace: string; visible: boolean; exit?: boolean };
+    const stack: TextVisit[] = [
+      { node: root, whiteSpace: styleOf(root).whiteSpace, visible: !isVisibilityHidden(root) },
+    ];
     while (stack.length) {
-      const { node, whiteSpace, exit } = stack.pop()!;
+      const { node, whiteSpace, visible, exit } = stack.pop()!;
       if (node !== root) tick();
       if (exit) {
         pendingBreak = true;
@@ -170,12 +209,12 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
         continue;
       }
       if (node.nodeType === Node.TEXT_NODE) {
-        append(node.nodeValue ?? "", whiteSpace);
+        if (visible) append(node.nodeValue ?? "", whiteSpace);
         continue;
       }
       if (!(node instanceof Element)) continue;
       if (
-        isHidden(node) ||
+        isSubtreeHidden(node) ||
         (node instanceof SVGElement && !renderedSvg.has(node.localName)) ||
         node.matches(
           'script,style,template,noscript,input[type="password"],input[type="hidden"]',
@@ -183,8 +222,9 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
         (node !== root && node.matches(tableSelector))
       )
         continue;
+      const nodeVisible = !isVisibilityHidden(node);
       if (node.tagName === "BR") {
-        newline();
+        if (nodeVisible) newline();
         continue;
       }
       const style = styleOf(node);
@@ -196,18 +236,19 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
       if (block) {
         pendingBreak = true;
         pendingSpace = false;
-        stack.push({ node, whiteSpace, exit: true });
+        stack.push({ node, whiteSpace, visible: nodeVisible, exit: true });
       }
       if (node instanceof HTMLInputElement) {
-        if (!["checkbox", "radio", "file", "image"].includes(node.type))
+        if (nodeVisible && !["checkbox", "radio", "file", "image"].includes(node.type))
           append(node.value, "pre-wrap");
         continue;
       }
       if (node instanceof HTMLTextAreaElement) {
-        append(node.value, "pre-wrap");
+        if (nodeVisible) append(node.value, "pre-wrap");
         continue;
       }
       if (node instanceof HTMLSelectElement) {
+        if (!nodeVisible) continue;
         for (const [index, option] of Array.from(node.selectedOptions).entries()) {
           tick();
           if (index) newline();
@@ -217,7 +258,7 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
       }
       const children = childrenOf(node);
       for (let index = children.length - 1; index >= 0; index--)
-        stack.push({ node: children[index], whiteSpace: style.whiteSpace });
+        stack.push({ node: children[index], whiteSpace: style.whiteSpace, visible: nodeVisible });
     }
     return pieces.join("");
   };
@@ -511,16 +552,18 @@ export function collectExtractDom(this: Element, options: CollectorOptions): Raw
     let dataRows = 0;
     const dataPositions = new Set<number>();
     let sawData = false;
+    let ownedRows = 0;
     for (let index = 0; index < rows.length; index++) {
       try {
         tick();
         const element = rows[index];
         if (element.closest(tableSelector) !== root) continue;
+        ownedRows++;
         if (isHidden(element)) {
-          omit(element, index + 1, "aria-rowindex");
+          omit(element, ownedRows, "aria-rowindex");
           continue;
         }
-        const position = ariaIndex(element, "aria-rowindex", index + 1);
+        const position = ariaIndex(element, "aria-rowindex", ownedRows);
         const sourceRow = position.value;
         // Recycled/virtual rows may appear in any DOM order; normalize sorts them.
         if (position.explicit) result.aria_rows = true;
