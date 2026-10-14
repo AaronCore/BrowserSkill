@@ -17,8 +17,8 @@ interface Candidate {
 /** Keep unrelated tabs out of live task windows without recreating their pages. */
 export class AgentWindowRouting {
   private readonly candidates = new Map<number, Candidate>();
-  private readonly pageOpened = new Set<number>();
-  private readonly sources = new Map<number, number>();
+  private readonly tabWindows = new Map<number, number>();
+  private readonly pageSourceWindows = new Map<number, number>();
   private readonly userWindows: number[] = [];
   private readonly scanned = new WeakSet<SessionContext>();
   private focusedWindow = -1;
@@ -86,8 +86,8 @@ export class AgentWindowRouting {
     windows.onFocusChanged.removeListener(this.focusChanged);
     windows.onRemoved.removeListener(this.windowRemoved);
     for (const id of this.candidates.keys()) this.forget(id);
-    this.pageOpened.clear();
-    this.sources.clear();
+    this.tabWindows.clear();
+    this.pageSourceWindows.clear();
   }
 
   private live(task: SessionContext): boolean {
@@ -101,14 +101,18 @@ export class AgentWindowRouting {
   private protected(task: SessionContext, tabId: number): boolean {
     return (
       isAgentControlledTab(task, tabId) ||
-      this.pageOpened.has(tabId) ||
+      this.pageSourceWindows.get(tabId) === task.agentWindowId ||
       this.manager.findBorrowingSession(tabId, null) !== null ||
       this.userControlled(task.sessionId)
     );
   }
 
   private created = (tab: chrome.tabs.Tab): void => {
-    if (tab.id === undefined || this.candidates.has(tab.id)) return;
+    if (this.disposed || tab.id === undefined) return;
+    // Track location even while human assistance suppresses routing, and
+    // independently of whether an agent has permission to control this tab.
+    this.tabWindows.set(tab.id, tab.windowId);
+    if (this.candidates.has(tab.id)) return;
     const task = this.manager.findByWindowId(tab.windowId);
     if (!task || !this.live(task) || this.protected(task, tab.id)) return;
     const candidate: Candidate = { task, attempt: 0 };
@@ -116,10 +120,13 @@ export class AgentWindowRouting {
     this.schedule(tab.id, candidate, SOURCE_SETTLE_MS);
   };
 
-  private attached = (id: number): void => {
+  private attached = (id: number, info: chrome.tabs.TabAttachInfo): void => {
+    this.tabWindows.set(id, info.newWindowId);
     void this.api.tabs
       .get(id)
-      .then(this.created)
+      .then((tab) => {
+        if (this.tabWindows.get(id) === info.newWindowId) this.created(tab);
+      })
       .catch(() => {});
   };
 
@@ -134,19 +141,20 @@ export class AgentWindowRouting {
   private forget = (id: number): void => {
     clearTimeout(this.candidates.get(id)?.timer);
     this.candidates.delete(id);
-    this.pageOpened.delete(id);
-    this.sources.delete(id);
+    this.tabWindows.delete(id);
+    this.pageSourceWindows.delete(id);
   };
 
   private navigationTarget = (
     details: chrome.webNavigation.WebNavigationSourceCallbackDetails,
   ): void => {
-    // Retain browser provenance without granting control or cleanup authority.
-    if (
-      this.manager.findControllingSession(details.sourceTabId) ||
-      this.candidates.has(details.tabId)
-    )
-      this.sources.set(details.tabId, details.sourceTabId);
+    // Snapshot provenance when Chrome reports it: the source can close or
+    // move before routing runs. Neither a candidate nor control permission is
+    // required, so multi-level popups opened during human assistance survive.
+    // Chrome assigns openerTabId to native external links too; only this event
+    // establishes page provenance, without granting control or cleanup rights.
+    const windowId = this.tabWindows.get(details.sourceTabId);
+    if (windowId !== undefined) this.pageSourceWindows.set(details.tabId, windowId);
   };
 
   private focusChanged = (id: number): void => {
@@ -192,7 +200,6 @@ export class AgentWindowRouting {
           try {
             await this.route(id, candidate.task);
             this.candidates.delete(id);
-            this.sources.delete(id);
           } catch (error) {
             if (this.candidates.get(id) !== candidate) return;
             if (!this.live(candidate.task)) {
@@ -229,7 +236,7 @@ export class AgentWindowRouting {
       available.find((window) => window.focused) ??
       available[0];
     // Recheck after lookups: the user can move the tab or a borrow can begin.
-    let current = await this.api.tabs.get(id).catch(() => undefined);
+    const current = await this.api.tabs.get(id).catch(() => undefined);
     if (
       !current ||
       current.windowId !== task.agentWindowId ||
@@ -237,25 +244,6 @@ export class AgentWindowRouting {
       this.protected(task, id)
     )
       return;
-    // Navigation provenance may arrive while destination lookup is pending.
-    // Chrome may assign openerTabId even to a URL opened by another
-    // application. Only a navigation-target event establishes page provenance.
-    const sourceId = this.sources.get(id);
-    if (sourceId !== undefined) {
-      const source = await this.api.tabs.get(sourceId).catch(() => undefined);
-      if (source?.windowId === task.agentWindowId) {
-        this.pageOpened.add(id);
-        return;
-      }
-      current = await this.api.tabs.get(id).catch(() => undefined);
-      if (
-        !current ||
-        current.windowId !== task.agentWindowId ||
-        !this.live(task) ||
-        this.protected(task, id)
-      )
-        return;
-    }
     const focusRevision = this.focusRevision;
     const show = current.active && this.focusedWindow === task.agentWindowId;
     let destinationId = destination?.id;

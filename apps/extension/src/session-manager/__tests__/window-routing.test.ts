@@ -94,6 +94,7 @@ async function fixture() {
   const userControlled = vi.fn(() => false);
   const router = new AgentWindowRouting(manager, api as unknown as typeof chrome, userControlled);
   dispose.push(() => router.dispose());
+  api.tabs.onCreated.emit(tabs.get(100)!);
   await vi.advanceTimersByTimeAsync(0);
   function add(id: number, props: Partial<chrome.tabs.Tab> = {}) {
     const tab = {
@@ -231,6 +232,105 @@ describe("Agent Window routing", () => {
     expect(f.tabs.get(101)?.windowId).toBe(1);
   });
 
+  it("keeps a page-opened tab after its source closes", async () => {
+    const f = await fixture();
+    f.task.agentCreatedTabs.add(101);
+    f.add(101);
+    f.add(102);
+    f.api.webNavigation.onCreatedNavigationTarget.emit({ tabId: 102, sourceTabId: 101 });
+    f.tabs.delete(101);
+    f.manager.forgetClosedTab(101);
+    f.api.tabs.onRemoved.emit(101, { windowId: 10, isWindowClosing: false });
+    await vi.advanceTimersByTimeAsync(150);
+    f.api.tabs.onUpdated.emit(102, { title: "Destination" }, f.tabs.get(102)!);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(f.tabs.get(102)?.windowId).toBe(10);
+    expect(f.manager.findControllingSession(102)).toBeNull();
+  });
+
+  it("retains multi-level page provenance after human assistance ends", async () => {
+    const f = await fixture();
+    f.userControlled.mockReturnValue(true);
+    f.add(101);
+    f.api.webNavigation.onCreatedNavigationTarget.emit({ tabId: 101, sourceTabId: 100 });
+    f.add(102);
+    f.api.webNavigation.onCreatedNavigationTarget.emit({ tabId: 102, sourceTabId: 101 });
+    await vi.advanceTimersByTimeAsync(150);
+    f.userControlled.mockReturnValue(false);
+    for (const id of [101, 102])
+      f.api.tabs.onUpdated.emit(id, { title: "Help completed" }, f.tabs.get(id)!);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(f.api.tabs.move).not.toHaveBeenCalled();
+    expect(f.manager.findControllingSession(101)).toBeNull();
+    expect(f.manager.findControllingSession(102)).toBeNull();
+  });
+
+  it("uses the source window at creation even if the source later moves", async () => {
+    const f = await fixture();
+    f.add(101);
+    f.api.webNavigation.onCreatedNavigationTarget.emit({ tabId: 101, sourceTabId: 100 });
+    await f.api.tabs.move(100, { windowId: 2 });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(f.tabs.get(101)?.windowId).toBe(10);
+    expect(f.manager.findControllingSession(101)).toBeNull();
+  });
+
+  it("does not infer the source window from control of a relocated tab", async () => {
+    const f = await fixture();
+    await f.api.tabs.move(100, { windowId: 2 });
+    f.add(101);
+    f.api.webNavigation.onCreatedNavigationTarget.emit({ tabId: 101, sourceTabId: 100 });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(f.tabs.get(101)?.windowId).toBe(1);
+  });
+
+  it("retains provenance received before target creation for an uncontrolled source", async () => {
+    const f = await fixture();
+    f.userControlled.mockReturnValue(true);
+    f.add(101);
+    f.userControlled.mockReturnValue(false);
+    f.api.webNavigation.onCreatedNavigationTarget.emit({ tabId: 102, sourceTabId: 101 });
+    f.add(102);
+    f.tabs.delete(101);
+    f.api.tabs.onRemoved.emit(101, { windowId: 10, isWindowClosing: false });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(f.tabs.get(102)?.windowId).toBe(10);
+    expect(f.manager.findControllingSession(102)).toBeNull();
+  });
+
+  it("records an attached source before its asynchronous tab lookup completes", async () => {
+    const f = await fixture();
+    f.userControlled.mockReturnValue(true);
+    f.add(101, { windowId: 2 });
+    const get = f.api.tabs.get.getMockImplementation()!;
+    let complete!: (tab: chrome.tabs.Tab) => void;
+    f.api.tabs.get.mockImplementationOnce(() => new Promise((resolve) => (complete = resolve)));
+    await f.api.tabs.move(101, { windowId: 10 });
+    f.add(102);
+    f.api.webNavigation.onCreatedNavigationTarget.emit({ tabId: 102, sourceTabId: 101 });
+    const source = await get(101);
+    f.tabs.delete(101);
+    f.api.tabs.onRemoved.emit(101, { windowId: 10, isWindowClosing: false });
+    complete(source);
+    f.userControlled.mockReturnValue(false);
+    f.api.tabs.onUpdated.emit(102, { title: "Complete" }, f.tabs.get(102)!);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(f.tabs.get(102)?.windowId).toBe(10);
+    expect(f.manager.findControllingSession(102)).toBeNull();
+  });
+
+  it("forgets a page's routing exemption when it is detached", async () => {
+    const f = await fixture();
+    f.add(101);
+    f.api.webNavigation.onCreatedNavigationTarget.emit({ tabId: 101, sourceTabId: 100 });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(f.tabs.get(101)?.windowId).toBe(10);
+    await f.api.tabs.move(101, { windowId: 2 });
+    await f.api.tabs.move(101, { windowId: 10 });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(f.tabs.get(101)?.windowId).toBe(1);
+  });
+
   it("waits for popup observation to settle before routing", async () => {
     const f = await fixture();
     const finish = beginTabCreation(f.task);
@@ -249,6 +349,21 @@ describe("Agent Window routing", () => {
     await vi.advanceTimersByTimeAsync(150);
     expect(f.tabs.get(101)?.windowId).toBe(1);
     expect(f.tabs.get(100)?.windowId).toBe(10);
+  });
+
+  it("records source windows from the startup scan during human assistance", async () => {
+    const f = await fixture();
+    f.userControlled.mockReturnValue(true);
+    f.tabs.set(101, { id: 101, windowId: 10, incognito: false } as chrome.tabs.Tab);
+    f.router.sync();
+    await vi.advanceTimersByTimeAsync(0);
+    f.add(102);
+    f.api.webNavigation.onCreatedNavigationTarget.emit({ tabId: 102, sourceTabId: 101 });
+    f.userControlled.mockReturnValue(false);
+    f.api.tabs.onUpdated.emit(102, { title: "Complete" }, f.tabs.get(102)!);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(f.tabs.get(102)?.windowId).toBe(10);
+    expect(f.manager.findControllingSession(102)).toBeNull();
   });
 
   it("leaves user interactions during recording or human assistance alone", async () => {

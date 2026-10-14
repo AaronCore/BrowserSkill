@@ -11,7 +11,10 @@ export function watchPopupFocus(windowId: number) {
   let before: { focused: number; state: typeof state } | undefined;
   let userSwitched = false;
   const onFocus = (id: number) => {
-    if (before && id !== windowId && id !== focused) userSwitched = true;
+    // Some Linux window managers emit WINDOW_ID_NONE between Chrome windows.
+    // Keep it as current focus so a final app switch prevents recovery, but
+    // only a different Chrome window makes the user's switch definitive.
+    if (before && id >= 0 && id !== windowId && id !== focused) userSwitched = true;
     focused = id;
     revision++;
   };

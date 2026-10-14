@@ -46,6 +46,38 @@ it("restores a minimized task window without selecting a user tab", async () => 
   expect(f.windows.update).toHaveBeenCalledExactlyOnceWith(10, { state: "minimized" });
 });
 
+it.each([
+  "normal",
+  "minimized",
+])("allows an intermediate no-window focus event (%s)", async (state) => {
+  const f = await fixture(1, state);
+  f.focus(-1);
+  f.focus(10);
+  await f.guard.finish(() => true);
+  expect(f.windows.update).toHaveBeenCalledExactlyOnceWith(
+    state === "minimized" ? 10 : 1,
+    state === "minimized" ? { state: "minimized" } : { focused: true },
+  );
+});
+
+it("leaves focus outside Chrome when the no-window event is final", async () => {
+  const f = await fixture();
+  f.focus(10);
+  f.focus(-1);
+  await f.guard.finish(() => true);
+  expect(f.windows.update).not.toHaveBeenCalled();
+});
+
+it("respects a switch to another Chrome window after a no-window event", async () => {
+  const f = await fixture();
+  f.focus(-1);
+  f.focus(2);
+  f.focus(-1);
+  f.focus(10);
+  await f.guard.finish(() => true);
+  expect(f.windows.update).not.toHaveBeenCalled();
+});
+
 it.each([-1, 10])("does not activate another window when original focus was %s", async (id) => {
   const f = await fixture(id);
   f.focus(10);

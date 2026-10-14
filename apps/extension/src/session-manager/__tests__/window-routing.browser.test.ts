@@ -52,7 +52,8 @@ globalThis.run=async(url,soak)=>{
  await chrome.tabs.update(control.id,{url:url+'/control'});
  await chrome.windows.update(user.id,{focused:true,left:0,top:0,width:1400,height:1000});
  await wait(async()=>(await chrome.tabs.get(control.id)).status==='complete','control load');
- const router=new AgentWindowRouting(manager);
+ let humanAssistance=false;
+ const router=new AgentWindowRouting(manager,chrome,()=>humanAssistance);
  await sleep(300);
  const focused=[],activated=[],removed=[];
  chrome.windows.onFocusChanged.addListener(id=>focused.push(id));
@@ -74,11 +75,14 @@ globalThis.run=async(url,soak)=>{
   globalThis.phase=label;
   await wait(async()=>await evaluate(id,"!!document.querySelector('#run')&&!document.querySelector('#run').disabled"),label+' ready');
   const before=await evaluate(id,'({frames:framesRun,ticks,clicks,hidden:document.hidden,cookie:document.cookie})');
+  globalThis.phase=label+' input';
   const result=await handleClick(manager,{...params,selector:'#run'},deps);
   check(!result.code,JSON.stringify(result));
   await wait(async()=>(await evaluate(id,'clicks'))>before.clicks,label+' input');
+  globalThis.phase=label+' snapshot';
   const snapshot=await handleSnapshot(manager,params,deps);
   check(!snapshot.code&&JSON.stringify(snapshot).includes('Completed'),label+' snapshot');
+  globalThis.phase=label+' screenshot';
   const screenshot=await cdp.send(id,'Page.captureScreenshot',{format:'png',fromSurface:true});
   const bitmap=await createImageBitmap(new Blob([Uint8Array.from(atob(screenshot.data),c=>c.charCodeAt(0))],{type:'image/png'}));
   const canvas=new OffscreenCanvas(bitmap.width,bitmap.height),context=canvas.getContext('2d');
@@ -175,12 +179,49 @@ globalThis.run=async(url,soak)=>{
    if((await chrome.windows.get(nativeFallback.windowId)).focused)return true;
    return focused.at(-1)===-1&&!(await chrome.windows.getAll()).some(window=>window.focused);
   },'native replacement foreground or respected application switch');
+  const replacementFocused=(await chrome.windows.get(nativeFallback.windowId)).focused;
+  // Runtime user gestures exercise real webNavigation events without granting
+  // the resulting pages agent ownership or popup-observation permissions.
+  const openPage=async(source,suffix)=>{
+   await cdp.send(source,'Runtime.evaluate',{
+    expression:'window.open('+JSON.stringify(url+suffix)+',"_blank");void 0',userGesture:true
+   });
+   let page;
+   await wait(async()=>{
+    page=(await chrome.tabs.query({url:url+suffix}))[0];
+    return page?.status==='complete';
+   },suffix+' load');
+   return page;
+  };
+  globalThis.phase='closed popup source';
+  const relay=await openPage(id,'/relay-source');
+  await cdp.send(relay.id,'Runtime.evaluate',{
+   expression:'window.open('+JSON.stringify(url+'/relay-destination')+',"_blank");window.close();void 0',
+   userGesture:true
+  }).catch(async error=>{if(await chrome.tabs.get(relay.id).catch(()=>null))throw error;});
+  await wait(async()=>!(await chrome.tabs.get(relay.id).catch(()=>null)),'relay source close');
+  await wait(async()=>(await chrome.tabs.query({url:url+'/relay-destination'})).length===1,'relay destination');
+  await sleep(500);
+  const [destination]=await chrome.tabs.query({url:url+'/relay-destination'});
+  check(destination.windowId===task.agentWindowId,'closed-source popup was routed away');
+  check(manager.findControllingSession(destination.id)===null,'provenance granted control');
+  globalThis.phase='human-assistance popup chain';
+  humanAssistance=true;
+  const intermediate=await openPage(id,'/help-intermediate');
+  const descendant=await openPage(intermediate.id,'/help-descendant');
+  humanAssistance=false;
+  await evaluate(descendant.id,'document.title="After human assistance";void 0');
+  await sleep(500);
+  for(const page of [intermediate,descendant]){
+   check((await chrome.tabs.get(page.id)).windowId===task.agentWindowId,'help popup was routed away');
+   check(manager.findControllingSession(page.id)===null,'help provenance granted control');
+  }
   return {states,backgroundFocusEvents,nativeExternal:true,replacementWindow:nativeFallback.windowId,
-   replacementFocused:(await chrome.windows.get(nativeFallback.windowId)).focused};
+   replacementFocused,closedSourcePopup:true,humanAssistancePopupChain:true};
  } catch(error) {
   throw new Error(JSON.stringify({error:error.message,phase:globalThis.phase,id,idleId,control:control.id,states,focused,removed,
    tabs:(await chrome.tabs.query({})).map(({id,windowId,url,frozen,discarded,openerTabId})=>({id,windowId,url,frozen,discarded,openerTabId})),
-   retained:[...router.pageOpened],sources:[...router.sources]}));
+   sources:[...router.pageSourceWindows]}));
  } finally {router.dispose();await cdp.detachAll();cdp.dispose();}
 };`;
 
