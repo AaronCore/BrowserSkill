@@ -114,8 +114,11 @@ conversations continue normally, and repeated identical failures do not flood lo
 
 Resolve the reported registration error, then invoke `/browser-skill` again or
 start the next turn to retry. Session entry and service discovery also retry a
-pending activation; streaming events do not. With `lazyTools: false`, a registration
-failure fails plugin startup and releases its resources; reload after fixing it.
+pending activation; streaming events do not. The affected conversation receives
+one recovery notice. If the failed model call never delivered the skill body,
+the notice asks the model to load it before using the tools. With `lazyTools: false`,
+a registration failure fails plugin startup and releases its resources; reload
+after fixing it.
 
 ## Multi-session model
 
@@ -194,9 +197,10 @@ All fields are optional; omitted fields use the defaults below:
 | `lazyTools` | `true` | Reveal the browser tools when the skill is invoked. Set `false` to register them at startup. |
 
 With `lazyTools: true`, only the skill's catalog entry is initially advertised to
-the model. The six `bsk_*` tool schemas are added to the system prompt after
-the `browser-skill` skill is successfully invoked, either by the model or through
-`/browser-skill`. Set `lazyTools: false` to make the tools available immediately.
+the model. A successful model `skill` call makes the six `bsk_*` schemas available
+in the next step. A user `/browser-skill` gesture activates them when the host
+claims the input, before prompt assembly, so the first request includes both the
+skill instructions and tool schemas. Set `lazyTools: false` to register at startup.
 
 After a plugin reload, a live or resumed conversation's successful skill invocation
 restores the tools from its stored history. If an older plugin reports

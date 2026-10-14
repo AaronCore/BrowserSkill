@@ -19,7 +19,9 @@ Starting from 0.2.0, CLI / Extension / DSH Plugin share the same version number.
 ### Fixed
 
 - DSH Plugin: roll back incomplete tool registration, surface activation failures,
-  and retry at skill/session lifecycle boundaries without leaving a partial suite
+  and retry at skill/session lifecycle boundaries without leaving a partial suite.
+  Include tool schemas in the first `/browser-skill` request, and keep failure and
+  recovery notices synchronized with model skill results
   ([#444](https://github.com/Tencent/BrowserSkill/issues/444)).
 - Extension: input to a background Agent Window tab no longer keeps failing with
   `input_not_ready` after Chrome drops the session's focus override without a detach

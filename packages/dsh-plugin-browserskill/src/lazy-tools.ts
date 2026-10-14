@@ -2,15 +2,15 @@
  * Lazy tool-schema injection ("progressive disclosure", final stage): with
  * `lazyTools` on (the default), the six browser tool schemas stay OUT of the
  * system prompt until the `browser-skill` skill has actually been invoked —
- * the skill catalog entry is the only advertisement. One successful
- * invocation (model tool call, or a user's `/browser-skill` gesture) reveals
+ * the skill catalog entry is the only advertisement. A successful model
+ * invocation or a claimed user `/browser-skill` gesture reveals
  * the whole suite for the rest of the process lifetime; repeated invocations
  * are idempotent no-ops. Session resume is covered by scanning durable
  * session events for a past successful invocation (tool/call + tool/result
  * pair, or a skill-invocation sourced message) when a session is entered or
  * first observed after a reload. Later events are consumed incrementally.
  *
- * Verified against dsh 0.1 (recorded in the PR ticket):
+ * Host lifecycle boundaries:
  * - `tools/post-execute` can turn a successful skill load into an actionable
  *   error before its result reaches the model. `tools/result` is too late.
  * - There is NO official global tool-visibility switch (`ctx.tools.restrict`
@@ -18,8 +18,9 @@
  *   registration + this hook is the intended pattern; the registry supports
  *   mid-flight register/dispose with an unfiltered `tools/change` notice, and
  *   tool-skill's per-step catalog digest treats visibility changes as a
- *   first-class cache-invalidation input — the suite simply appears in the
- *   NEXT step's assembly.
+ *   first-class cache-invalidation input. Model tool calls reveal the suite
+ *   for the next step; user gestures must reveal it at agent/inbox/claimed,
+ *   before assembly, so instructions and schemas reach the same request.
  * - DSH 0.2 stores toolCallId/isError on the message; DSH 0.1 uses a
  *   tool-result content block. Both carry message.source.callId. Older hosts
  *   stored callId/isError directly on the message.
@@ -89,6 +90,9 @@ function toolResultOf(data: unknown): { callId: string; isError: boolean } | und
 /** One session's append-only history fold; retain only unsettled skill calls. */
 class SkillInvocationState {
   successful = false;
+  // Live activation intent is not proof that the model received the skill body.
+  requested = false;
+  lastGesture: unknown;
   private readonly pending = new Set<string>();
 
   consume(event: SessionEventLike): void {
@@ -138,6 +142,28 @@ function isSkillInvocationMessage(data: unknown): boolean {
   return kind === "skill-invocation" && name === BSK_SKILL_NAME;
 }
 
+/** Match the official gesture grammar only in user-authored text blocks. */
+function isSkillGesture(message: unknown): boolean {
+  const value = record(message);
+  return (
+    value?.role === "user" &&
+    record(value.source)?.kind === "user" &&
+    Array.isArray(value.content) &&
+    value.content.some((block: unknown) => {
+      const content = record(block);
+      return (
+        content?.type === "text" &&
+        typeof content.text === "string" &&
+        /(^|\s)\/browser-skill(?=\s|$)/.test(content.text)
+      );
+    })
+  );
+}
+
+function gestureIdentity(message: unknown): unknown {
+  return record(message)?.id ?? message;
+}
+
 /**
  * A durable log proves the skill was successfully invoked when a successful
  * `tool/result` pairs a `tool/call` for skill/browser-skill — or when a
@@ -166,7 +192,6 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
   let revealPending = false;
   let failure: string | undefined;
   let sessionStates = new WeakMap<SessionLike, SkillInvocationState>();
-  const attemptedGestures = new WeakMap<SessionLike, unknown>();
   const notices = new WeakMap<SessionLike, string>();
   let suiteDisposer: (() => void) | undefined;
   const disposers: (() => void)[] = [];
@@ -183,7 +208,6 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
       suiteDisposer = dispose;
       revealPending = false;
       failure = undefined;
-      sessionStates = new WeakMap();
       return true;
     } catch (error) {
       revealPending = true;
@@ -199,33 +223,6 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
     `BrowserSkill tools are unavailable: ${failure}. ` +
     "Resolve the registration error, then invoke browser-skill again or start a new turn to retry. " +
     "Do not substitute another plugin's browser tools for the bsk_* tools.";
-
-  // Wrap other post-execute decisions so an existing block/error/cancellation
-  // stays authoritative. Never advertise a partial suite as a successful load.
-  disposers.push(
-    ctx.on(
-      "tools/post-execute",
-      async (exec, result, next) => {
-        const decision = await next();
-        if (
-          disposed ||
-          exec.signal.aborted ||
-          result.isError ||
-          decision.kind === "block" ||
-          exec.name !== "skill" ||
-          skillNameOf(exec.arguments) !== BSK_SKILL_NAME
-        )
-          return decision;
-        if (ensureSuite()) return decision;
-        return {
-          kind: "block",
-          feedback: [{ type: "text", text: unavailableMessage() }],
-          additionalContexts: decision.additionalContexts,
-        };
-      },
-      { prepend: true },
-    ),
-  );
 
   const stateFor = (session: SessionLike): SkillInvocationState | undefined => {
     const known = sessionStates.get(session);
@@ -249,43 +246,97 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
     }
   };
 
-  const invokeGesture = (session: SessionLike, message: unknown): void => {
-    // Pre-step sees the official skill injection before it is appended to the
-    // durable log. Its later session/event must not retry the same failed load.
-    const identity = record(message)?.id ?? message;
-    if (attemptedGestures.get(session) === identity) return;
-    attemptedGestures.set(session, identity);
+  const requestState = (session: SessionLike): SkillInvocationState => {
     const state = stateFor(session) ?? new SkillInvocationState();
-    state.successful = true;
+    state.requested = true;
     sessionStates.set(session, state);
-    notices.delete(session);
-    ensureSuite();
+    return state;
   };
+
+  const attemptGesture = (session: SessionLike, message: unknown): void => {
+    const state = requestState(session);
+    const identity = gestureIdentity(message);
+    if (state.lastGesture === identity) return;
+    state.lastGesture = identity;
+    // A new explicit retry may report the same failure again. On success keep
+    // the previous notice until pre-step acknowledges recovery to this session.
+    if (!ensureSuite()) notices.delete(session);
+  };
+
+  // Wrap other post-execute decisions so an existing block/error/cancellation
+  // stays authoritative. Never advertise a partial suite as a successful load.
+  disposers.push(
+    ctx.on(
+      "tools/post-execute",
+      async (exec, result, next) => {
+        const decision = await next();
+        if (
+          disposed ||
+          exec.signal.aborted ||
+          result.isError ||
+          decision.kind === "block" ||
+          exec.name !== "skill" ||
+          skillNameOf(exec.arguments) !== BSK_SKILL_NAME
+        )
+          return decision;
+        const session = exec.agent?.session;
+        if (session !== undefined) requestState(session);
+        if (ensureSuite()) return decision;
+        // This blocked tool result is already the session's failure notice.
+        if (session !== undefined && failure !== undefined) notices.set(session, failure);
+        return {
+          kind: "block",
+          feedback: [{ type: "text", text: unavailableMessage() }],
+          additionalContexts: decision.additionalContexts,
+        };
+      },
+      { prepend: true },
+    ),
+  );
+
+  // Inbox claims run synchronously before systemPrompt.assemble(). Pre-step
+  // is too late to add schemas to the current request's immutable assembly.
+  disposers.push(
+    ctx.on("agent/inbox/claimed", ({ agent, message }) => {
+      if (disposed || suiteDisposer !== undefined || !isSkillGesture(message)) return;
+      attemptGesture(agent.session, message);
+    }),
+  );
 
   disposers.push(
     ctx.on(
       "agent/pre-step",
-      async ({ agent, signal }, next) => {
+      async ({ agent, messages = [], signal }, next) => {
         const decision = await next();
         if (disposed || signal.aborted || decision.kind === "reject") return decision;
         const session = agent.session;
-        if (suiteDisposer === undefined) {
-          for (const message of decision.messages) {
-            if (isSkillInvocationMessage(message)) invokeGesture(session, message);
-          }
+        const claimed = messages.some(
+          (message) =>
+            isSkillGesture(message) &&
+            sessionStates.get(session)?.lastGesture === gestureIdentity(message),
+        );
+        for (const message of decision.messages) {
+          if (!isSkillInvocationMessage(message)) continue;
+          const state = requestState(session);
+          state.successful = true;
+          // The raw claim and official injection have different message IDs.
+          // Treat them, and the later durable append, as one activation attempt.
+          if (claimed) state.lastGesture = gestureIdentity(message);
+          else attemptGesture(session, message);
         }
         let text: string;
         if (suiteDisposer !== undefined) {
           if (!notices.has(session)) return decision;
           notices.delete(session);
-          text =
-            "BrowserSkill tools are now available. Use the bsk_* tools described by browser-skill.";
+          text = sessionStates.get(session)?.successful
+            ? "BrowserSkill tools are now available. Use the bsk_* tools described by browser-skill."
+            : 'BrowserSkill tools are now available. Call skill({ name: "browser-skill" }) to load the instructions before using bsk_* tools.';
         } else {
           // Do not inject diagnostics into conversations that never requested this
           // skill, or repeat the same notice on every model step.
           if (
             failure === undefined ||
-            !stateFor(session)?.successful ||
+            !(stateFor(session)?.successful || sessionStates.get(session)?.requested) ||
             notices.get(session) === failure
           ) {
             return decision;
@@ -324,10 +375,16 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
   // Live gesture/append feed: covers /browser-skill user gestures (no tool
   // call happens on that path) landing as skill-invocation messages.
   const onSessionEvent = (session: SessionLike, event: SessionEventLike): void => {
-    if (disposed || suiteDisposer !== undefined) return;
-    if (session == null || event == null) return;
+    if (disposed || session == null || event == null) return;
+    if (suiteDisposer !== undefined) {
+      // A successful skill result can settle after registration. Keep its proof
+      // for recovery guidance without rescanning history or retrying per token.
+      sessionStates.get(session)?.consume(event);
+      return;
+    }
     if (event.type === "user/message" && isSkillInvocationMessage(event.data)) {
-      invokeGesture(session, event.data);
+      requestState(session).successful = true;
+      attemptGesture(session, event.data);
       return;
     }
     if (revealPending && event.type === "turn/start") {
