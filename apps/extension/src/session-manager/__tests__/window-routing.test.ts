@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { resolveCdpAccessibleTargetTab, resolveTargetTab } from "@/tools/shared";
 import { handleTabCreate } from "@/tools/tabs";
 import { SessionManager } from "../manager";
 import { beginTabCreation } from "../tab-creation";
@@ -51,8 +52,8 @@ async function fixture() {
         if (!tab) throw new Error("No tab");
         return { ...tab };
       }),
-      query: vi.fn(async ({ windowId }: { windowId: number }) =>
-        [...tabs.values()].filter((t) => t.windowId === windowId),
+      query: vi.fn(async ({ windowId, active }: chrome.tabs.QueryInfo) =>
+        [...tabs.values()].filter((t) => t.windowId === windowId && (!active || t.active)),
       ),
       move: vi.fn(async (id: number, { windowId }: { windowId: number }) => {
         if (!windows.has(windowId)) throw new Error("No window");
@@ -118,6 +119,98 @@ async function fixture() {
 }
 
 describe("Agent Window routing", () => {
+  it("skips an external active tab before routing without changing browser selection", async () => {
+    const f = await fixture();
+    f.tabs.get(100)!.active = false;
+    f.add(101, { active: true });
+    expect(await resolveTargetTab(f.manager, f.task, undefined, f.api.tabs)).toMatchObject({
+      tabId: 100,
+      active: false,
+    });
+    expect(f.api.tabs.move).not.toHaveBeenCalled();
+    expect(f.api.tabs.update).not.toHaveBeenCalled();
+    expect(await resolveTargetTab(f.manager, f.task, 101, f.api.tabs)).toMatchObject({
+      tabId: 101,
+    });
+  });
+
+  it("fails default resolution when only unclaimed tabs await routing", async () => {
+    const f = await fixture();
+    f.tabs.get(100)!.active = false;
+    f.task.agentCreatedTabs.clear();
+    f.add(101, { active: true });
+    expect(await resolveTargetTab(f.manager, f.task, undefined, f.api.tabs)).toMatchObject({
+      code: "not_found",
+    });
+  });
+
+  it("prefers the most recently used controlled tab when an external tab becomes active", async () => {
+    const f = await fixture();
+    f.tabs.get(100)!.active = false;
+    f.tabs.get(100)!.lastAccessed = 1;
+    f.task.agentCreatedTabs.add(102);
+    f.add(102, { lastAccessed: 2 });
+    f.add(101, { active: true, lastAccessed: 3 });
+    expect(await resolveTargetTab(f.manager, f.task, undefined, f.api.tabs)).toMatchObject({
+      tabId: 102,
+    });
+  });
+
+  it("accepts confirmed page provenance as a local default without granting ownership", async () => {
+    const f = await fixture();
+    f.tabs.get(100)!.active = false;
+    f.add(101, { active: true });
+    f.api.webNavigation.onCreatedNavigationTarget.emit({ tabId: 101, sourceTabId: 100 });
+    expect(await resolveTargetTab(f.manager, f.task, undefined, f.api.tabs)).toMatchObject({
+      tabId: 101,
+    });
+    expect(f.manager.findControllingSession(101)).toBeNull();
+  });
+
+  it("accepts a newly claimed tab before its routing timer expires", async () => {
+    const f = await fixture();
+    f.tabs.get(100)!.active = false;
+    f.add(101, { active: true });
+    f.task.observedTabs = new Set([101]);
+    expect(await resolveTargetTab(f.manager, f.task, undefined, f.api.tabs)).toMatchObject({
+      tabId: 101,
+    });
+  });
+
+  it("releases a routing exclusion when the user moves the tab before asking for help", async () => {
+    const f = await fixture();
+    f.tabs.get(100)!.active = false;
+    f.add(101, { active: true });
+    await f.api.tabs.move(101, { windowId: 2 });
+    f.userControlled.mockReturnValue(true);
+    await f.api.tabs.move(101, { windowId: 10 });
+    expect(await resolveTargetTab(f.manager, f.task, undefined, f.api.tabs)).toMatchObject({
+      tabId: 101,
+    });
+  });
+
+  it("does not pick a pending external tab as the accessible-page fallback", async () => {
+    const f = await fixture();
+    f.tabs.get(100)!.url = "chrome://newtab/";
+    f.add(101, { url: "https://user.example/" });
+    expect(
+      await resolveCdpAccessibleTargetTab(f.manager, f.task, undefined, f.api.tabs, "snapshot"),
+    ).toMatchObject({
+      code: "permission_denied",
+    });
+  });
+
+  it("keeps an unrouteable external tab out of default targeting after retries", async () => {
+    const f = await fixture();
+    f.tabs.get(100)!.active = false;
+    f.add(101, { active: true });
+    f.api.tabs.move.mockRejectedValue(new Error("Move unavailable"));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(await resolveTargetTab(f.manager, f.task, undefined, f.api.tabs)).toMatchObject({
+      tabId: 100,
+    });
+  });
+
   it("returns unrelated tabs to the last user window after viewing the task", async () => {
     const f = await fixture();
     await f.focus(2);

@@ -32,12 +32,14 @@ document.querySelector('#run').onclick=()=>requestAnimationFrame(()=>{
 // and input/snapshot handlers in an extension page that survives user window close.
 const entry = `
 import { ChromiumCdp } from '@/browser-driver/chromium-cdp';
-import { SessionManager } from '@/session-manager/manager';
+import { isAgentControlledTab, SessionManager } from '@/session-manager/manager';
 import { AgentWindowRouting } from '@/session-manager/window-routing';
 import { withTaskPopups } from '@/session-manager/task-popups';
+import { beginTabCreation } from '@/session-manager/tab-creation';
 import { handleTabCreate } from '@/tools/tabs';
 import { handleClick } from '@/tools/interaction';
 import { handleSnapshot } from '@/tools/observation';
+import { handleNavigate } from '@/tools/navigation';
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const check=(ok,message)=>{if(!ok)throw new Error(message)};
 const wait=async(fn,label)=>{const deadline=Date.now()+10000;while(!(await fn())){
@@ -145,7 +147,28 @@ globalThis.run=async(url,soak)=>{
   check(!(await chrome.windows.get(task.agentWindowId)).focused,'task popup stole window focus');
   // Simulate Chrome choosing the task window for a background external tab.
   globalThis.phase='background external link';
-  const external=await chrome.tabs.create({windowId:task.agentWindowId,url:url+'/external-background',active:true});
+  await chrome.tabs.update(id,{active:true});
+  // Hold the same creation barrier used by concurrent agent operations so the
+  // unclassified tab remains active throughout default-target tool calls.
+  const finishCreation=beginTabCreation(task);
+  let external;
+  try {
+   external=await chrome.tabs.create({windowId:task.agentWindowId,url:url+'/external-background',active:true});
+   await wait(async()=>(await chrome.tabs.get(external.id)).status==='complete','external fixture load');
+   check(task.pendingRoutingTabs.has(external.id),'external tab is not pending routing');
+   const defaults={session_id:task.sessionId};
+   const navigated=await handleNavigate(manager,{...defaults,url:url+'/default-target'},deps);
+   const defaultId=navigated.tab_id;
+   check(!navigated.code&&defaultId!==external.id&&isAgentControlledTab(task,defaultId),'default navigation did not target a controlled task tab');
+   const clicked=await handleClick(manager,{...defaults,selector:'#run'},deps);
+   check(!clicked.code&&clicked.tab_id===defaultId,'default click did not target the selected task tab');
+   await wait(async()=>(await evaluate(defaultId,'clicks'))>0,'default task click');
+   const snapshot=await handleSnapshot(manager,defaults,deps);
+   check(!snapshot.code&&snapshot.tab_id===defaultId,'default snapshot did not target the selected task tab');
+   const pending=await chrome.tabs.get(external.id);
+   check(pending.windowId===task.agentWindowId&&pending.url===url+'/external-background','external tab changed before routing');
+   check(await evaluate(external.id,'clicks')===0,'default click changed the external page');
+  } finally {finishCreation();}
   await wait(async()=>(await chrome.tabs.get(external.id)).windowId===user.id,'background external routing');
   check((await chrome.tabs.get(control.id)).active,'routing changed user selection');
   check(!(await chrome.windows.get(task.agentWindowId)).focused,'routing stole focus');
@@ -203,7 +226,7 @@ globalThis.run=async(url,soak)=>{
   await wait(async()=>(await chrome.tabs.query({url:url+'/relay-destination'})).length===1,'relay destination');
   await sleep(500);
   const [destination]=await chrome.tabs.query({url:url+'/relay-destination'});
-  check(destination.windowId===task.agentWindowId,'closed-source popup was routed away');
+  check(destination.windowId===task.agentWindowId,'closed-source popup was not kept in the task window');
   check(manager.findControllingSession(destination.id)===null,'provenance granted control');
   globalThis.phase='human-assistance popup chain';
   humanAssistance=true;
@@ -213,11 +236,11 @@ globalThis.run=async(url,soak)=>{
   await evaluate(descendant.id,'document.title="After human assistance";void 0');
   await sleep(500);
   for(const page of [intermediate,descendant]){
-   check((await chrome.tabs.get(page.id)).windowId===task.agentWindowId,'help popup was routed away');
+   check((await chrome.tabs.get(page.id)).windowId===task.agentWindowId,'help popup was not kept in the task window');
    check(manager.findControllingSession(page.id)===null,'help provenance granted control');
   }
   return {states,backgroundFocusEvents,nativeExternal:true,replacementWindow:nativeFallback.windowId,
-   replacementFocused,closedSourcePopup:true,humanAssistancePopupChain:true};
+   replacementFocused,closedSourcePopup:true,humanAssistancePopupChain:true,defaultTargetProtected:true};
  } catch(error) {
   throw new Error(JSON.stringify({error:error.message,phase:globalThis.phase,id,idleId,control:control.id,states,focused,removed,
    tabs:(await chrome.tabs.query({})).map(({id,windowId,url,frozen,discarded,openerTabId})=>({id,windowId,url,frozen,discarded,openerTabId})),

@@ -86,6 +86,7 @@ export class AgentWindowRouting {
     windows.onFocusChanged.removeListener(this.focusChanged);
     windows.onRemoved.removeListener(this.windowRemoved);
     for (const id of this.candidates.keys()) this.forget(id);
+    for (const task of this.manager.list()) task.pendingRoutingTabs?.clear();
     this.tabWindows.clear();
     this.pageSourceWindows.clear();
   }
@@ -117,6 +118,7 @@ export class AgentWindowRouting {
     if (!task || !this.live(task) || this.protected(task, tab.id)) return;
     const candidate: Candidate = { task, attempt: 0 };
     this.candidates.set(tab.id, candidate);
+    (task.pendingRoutingTabs ??= new Set()).add(tab.id);
     this.schedule(tab.id, candidate, SOURCE_SETTLE_MS);
   };
 
@@ -138,9 +140,16 @@ export class AgentWindowRouting {
     this.created(tab);
   };
 
-  private forget = (id: number): void => {
+  private clearCandidate(id: number): void {
     clearTimeout(this.candidates.get(id)?.timer);
     this.candidates.delete(id);
+  }
+
+  private forget = (id: number): void => {
+    const task =
+      this.candidates.get(id)?.task ?? this.manager.findByWindowId(this.tabWindows.get(id) ?? -1);
+    task?.pendingRoutingTabs?.delete(id);
+    this.clearCandidate(id);
     this.tabWindows.delete(id);
     this.pageSourceWindows.delete(id);
   };
@@ -154,7 +163,10 @@ export class AgentWindowRouting {
     // Chrome assigns openerTabId to native external links too; only this event
     // establishes page provenance, without granting control or cleanup rights.
     const windowId = this.tabWindows.get(details.sourceTabId);
-    if (windowId !== undefined) this.pageSourceWindows.set(details.tabId, windowId);
+    if (windowId !== undefined) {
+      this.pageSourceWindows.set(details.tabId, windowId);
+      this.manager.findByWindowId(windowId)?.pendingRoutingTabs?.delete(details.tabId);
+    }
   };
 
   private focusChanged = (id: number): void => {
@@ -199,7 +211,10 @@ export class AgentWindowRouting {
           }
           try {
             await this.route(id, candidate.task);
-            this.candidates.delete(id);
+            if (this.candidates.get(id) === candidate) {
+              this.clearCandidate(id);
+              candidate.task.pendingRoutingTabs?.delete(id);
+            }
           } catch (error) {
             if (this.candidates.get(id) !== candidate) return;
             if (!this.live(candidate.task)) {
@@ -209,7 +224,9 @@ export class AgentWindowRouting {
             const retry = RETRY_DELAYS[candidate.attempt++];
             if (retry !== undefined) this.schedule(id, candidate, retry);
             else {
-              this.forget(id);
+              // Keep the unresolved tab excluded from default tool targeting
+              // until it moves, closes, is claimed, or gets page provenance.
+              this.clearCandidate(id);
               console.warn("[bsk] could not return unrelated tab to a user window", id, error);
             }
           }
