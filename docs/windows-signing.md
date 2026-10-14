@@ -18,7 +18,7 @@ Replace `REVIEWED_COMMIT_SHA` with the exact reviewed deployment commit, not a m
 
 Associate `Tencent/BrowserSkill` with the project and grant the standard **Tencent Blueking DevOps** GitHub App access to the repository. After importing the pipeline YAML, use the UI to add a **GitHub event trigger**, choose **Create Branch Or Tag**, and include only `cli-v*`. Publish from the UI. Some internal versions drop CREATE events when converting UI configuration back to YAML; do not switch modes after adding this trigger. Branch creation events are rejected by the signing script even if their name matches.
 
-Keep signing credentials confined to the signing step. The GitHub credential is available only to the preparation and return steps. Do not enable pull-request triggers or use failure-continue on any step.
+The Bash plugin resolves the credential expression in its script; the template disables command tracing before exporting it. Step-level environment expressions were not resolved by the tested internal deployment. Keep signing credentials confined to the signing step. The GitHub credential is available only to the preparation and return steps. Do not enable pull-request triggers or use failure-continue on any step.
 
 ## Release and recovery
 

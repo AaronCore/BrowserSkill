@@ -24,12 +24,12 @@ stages:
         id: prepare
         uses: linuxScript@1.*
         timeout-minutes: 65
-        env:
-          GH_TOKEN: "${{settings.GITHUB_RELEASE_CREDENTIAL.access_token}}"
         with:
           script: |
             #!/usr/bin/env bash
             set -euo pipefail
+            set +x
+            export GH_TOKEN='${{settings.GITHUB_RELEASE_CREDENTIAL.access_token}}'
             cd "${{ci.workspace}}"
             SCRIPT_COMMIT=REVIEWED_COMMIT_SHA
             curl --fail --silent --show-error --location --retry 3 --max-time 180 \
@@ -63,12 +63,12 @@ stages:
         id: return_signed
         uses: linuxScript@1.*
         timeout-minutes: 10
-        env:
-          GH_TOKEN: "${{settings.GITHUB_RELEASE_CREDENTIAL.access_token}}"
         with:
           script: |
             #!/usr/bin/env bash
             set -euo pipefail
+            set +x
+            export GH_TOKEN='${{settings.GITHUB_RELEASE_CREDENTIAL.access_token}}'
             cd "${{ci.workspace}}"
             python3 windows-release.py return-signed
       - name: Archive signing evidence
