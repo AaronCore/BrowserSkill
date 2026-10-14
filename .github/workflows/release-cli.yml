@@ -125,4 +125,3 @@ jobs:
           name: bsk-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
-
