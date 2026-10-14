@@ -11,8 +11,8 @@
  * first observed after a reload. Later events are consumed incrementally.
  *
  * Verified against dsh 0.1 (recorded in the PR ticket):
- * - `tools/result(exec, result)`: exec carries normalized `name`/`arguments`,
- *   result is discriminated by `isError` — the model-invocation trigger.
+ * - `tools/post-execute` can turn a successful skill load into an actionable
+ *   error before its result reaches the model. `tools/result` is too late.
  * - There is NO official global tool-visibility switch (`ctx.tools.restrict`
  *   is agent-scoped and throws from a plain host context), so conditional
  *   registration + this hook is the intended pattern; the registry supports
@@ -26,6 +26,8 @@
  */
 
 import type { Context } from "@deepseek-ai/cordis";
+import { createUserMessage } from "@deepseek-ai/dsh-llm";
+import { disposeAll } from "./disposables";
 import { BSK_SKILL_NAME } from "./skill-content.generated";
 
 /** Structural view of the pieces of the session seam we consume. */
@@ -39,11 +41,6 @@ interface SessionEventLike {
 }
 interface SessionsLike {
   list(): SessionLike[];
-}
-
-interface ToolResultExecutionLike {
-  name: string;
-  arguments?: unknown;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -161,35 +158,74 @@ export function hasSuccessfulSkillInvocation(events: readonly SessionEventLike[]
  * @param registerSuite - registers the six browser tools and returns their disposer.
  */
 export function armLazyTools(ctx: Context, registerSuite: () => () => void): () => void {
+  // Idle -> registering -> active. Failure returns to idle with intent retained;
+  // disposal is terminal. Registration can synchronously publish tools/change,
+  // so guard reentry without treating an incomplete suite as active.
   let disposed = false;
+  let registering = false;
   let revealPending = false;
+  let failure: string | undefined;
   let sessionStates = new WeakMap<SessionLike, SkillInvocationState>();
+  const attemptedGestures = new WeakMap<SessionLike, unknown>();
+  const notices = new WeakMap<SessionLike, string>();
   let suiteDisposer: (() => void) | undefined;
   const disposers: (() => void)[] = [];
-  const ensureSuite = (): void => {
-    if (disposed || suiteDisposer !== undefined) return;
+  const ensureSuite = (): boolean => {
+    if (disposed || registering) return false;
+    if (suiteDisposer !== undefined) return true;
+    registering = true;
     try {
-      suiteDisposer = registerSuite();
+      const dispose = registerSuite();
+      if (disposed) {
+        dispose();
+        return false;
+      }
+      suiteDisposer = dispose;
       revealPending = false;
+      failure = undefined;
       sessionStates = new WeakMap();
+      return true;
     } catch (error) {
-      // Keep successful invocation proof, but retry only at a lifecycle
-      // boundary or a new invocation, never on every streaming chunk.
-      suiteDisposer = undefined;
       revealPending = true;
-      console.warn(
-        `[dsh-plugin-browserskill] lazy tool registration failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const detail = error instanceof Error ? error.message : String(error);
+      if (detail !== failure) ctx.logger.error("BrowserSkill tool activation failed", error);
+      failure = detail;
+      return false;
+    } finally {
+      registering = false;
     }
   };
+  const unavailableMessage = () =>
+    `BrowserSkill tools are unavailable: ${failure}. ` +
+    "Resolve the registration error, then invoke browser-skill again or start a new turn to retry. " +
+    "Do not substitute another plugin's browser tools for the bsk_* tools.";
 
-  // Live trigger: a successful model invocation of skill/browser-skill.
-  const onToolResult = (exec: ToolResultExecutionLike, result: { isError: boolean }): void => {
-    if (result.isError !== false) return;
-    if (exec.name !== "skill") return;
-    if (skillNameOf(exec.arguments) === BSK_SKILL_NAME) ensureSuite();
-  };
-  disposers.push(ctx.on("tools/result" as never, onToolResult as never));
+  // Wrap other post-execute decisions so an existing block/error/cancellation
+  // stays authoritative. Never advertise a partial suite as a successful load.
+  disposers.push(
+    ctx.on(
+      "tools/post-execute",
+      async (exec, result, next) => {
+        const decision = await next();
+        if (
+          disposed ||
+          exec.signal.aborted ||
+          result.isError ||
+          decision.kind === "block" ||
+          exec.name !== "skill" ||
+          skillNameOf(exec.arguments) !== BSK_SKILL_NAME
+        )
+          return decision;
+        if (ensureSuite()) return decision;
+        return {
+          kind: "block",
+          feedback: [{ type: "text", text: unavailableMessage() }],
+          additionalContexts: decision.additionalContexts,
+        };
+      },
+      { prepend: true },
+    ),
+  );
 
   const stateFor = (session: SessionLike): SkillInvocationState | undefined => {
     const known = sessionStates.get(session);
@@ -213,6 +249,73 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
     }
   };
 
+  const invokeGesture = (session: SessionLike, message: unknown): void => {
+    // Pre-step sees the official skill injection before it is appended to the
+    // durable log. Its later session/event must not retry the same failed load.
+    const identity = record(message)?.id ?? message;
+    if (attemptedGestures.get(session) === identity) return;
+    attemptedGestures.set(session, identity);
+    const state = stateFor(session) ?? new SkillInvocationState();
+    state.successful = true;
+    sessionStates.set(session, state);
+    notices.delete(session);
+    ensureSuite();
+  };
+
+  disposers.push(
+    ctx.on(
+      "agent/pre-step",
+      async ({ agent, signal }, next) => {
+        const decision = await next();
+        if (disposed || signal.aborted || decision.kind === "reject") return decision;
+        const session = agent.session;
+        if (suiteDisposer === undefined) {
+          for (const message of decision.messages) {
+            if (isSkillInvocationMessage(message)) invokeGesture(session, message);
+          }
+        }
+        let text: string;
+        if (suiteDisposer !== undefined) {
+          if (!notices.has(session)) return decision;
+          notices.delete(session);
+          text =
+            "BrowserSkill tools are now available. Use the bsk_* tools described by browser-skill.";
+        } else {
+          // Do not inject diagnostics into conversations that never requested this
+          // skill, or repeat the same notice on every model step.
+          if (
+            failure === undefined ||
+            !stateFor(session)?.successful ||
+            notices.get(session) === failure
+          ) {
+            return decision;
+          }
+          notices.set(session, failure);
+          text = unavailableMessage();
+        }
+        return {
+          ...decision,
+          messages: [
+            ...decision.messages,
+            createUserMessage({
+              content: [{ type: "text", text }],
+              source: {
+                kind: "plugin",
+                plugin: "@wxg-prc-cpg/browser-skill-dsh-plugin",
+                form: "notice",
+                summary:
+                  suiteDisposer === undefined
+                    ? "BrowserSkill tools unavailable"
+                    : "BrowserSkill tools available",
+              },
+            }),
+          ],
+        };
+      },
+      { prepend: true },
+    ),
+  );
+
   const scanSession = (session: SessionLike): void => {
     if (disposed || suiteDisposer !== undefined) return;
     if (revealPending || stateFor(session)?.successful) ensureSuite();
@@ -222,14 +325,15 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
   // call happens on that path) landing as skill-invocation messages.
   const onSessionEvent = (session: SessionLike, event: SessionEventLike): void => {
     if (disposed || suiteDisposer !== undefined) return;
-    if (
-      (revealPending && event?.type === "turn/start") ||
-      (event?.type === "user/message" && isSkillInvocationMessage(event.data))
-    ) {
+    if (session == null || event == null) return;
+    if (event.type === "user/message" && isSkillInvocationMessage(event.data)) {
+      invokeGesture(session, event.data);
+      return;
+    }
+    if (revealPending && event.type === "turn/start") {
       ensureSuite();
       return;
     }
-    if (session == null || event == null) return;
     // The first event can expose a session missed during startup. Scan its
     // existing history once; never read/copy the log on subsequent tokens.
     const state = stateFor(session);
@@ -273,8 +377,9 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
   return () => {
     if (disposed) return;
     disposed = true;
-    for (const dispose of disposers.splice(0)) dispose();
-    suiteDisposer?.();
+    if (suiteDisposer !== undefined) disposers.push(suiteDisposer);
+    suiteDisposer = undefined;
     sessionStates = new WeakMap();
+    disposeAll(disposers);
   };
 }

@@ -109,40 +109,40 @@ function fakeRunner(responses: Record<string, unknown>) {
 }
 
 const ACTION_ROUTES: Record<string, readonly [string, string]> = {
-  "session.start": ["browser_session", "start"],
-  "session.stop": ["browser_session", "stop"],
-  "session.list": ["browser_session", "list"],
-  "page.navigate": ["browser_page", "navigate"],
-  "page.back": ["browser_page", "back"],
-  "page.forward": ["browser_page", "forward"],
-  "page.reload": ["browser_page", "reload"],
-  "page.wait": ["browser_page", "wait"],
-  "page.wait-for-element": ["browser_page", "wait-for-element"],
-  "inspect.observe": ["browser_inspect", "observe"],
-  "inspect.snapshot": ["browser_inspect", "snapshot"],
-  "inspect.html": ["browser_inspect", "html"],
-  "inspect.screenshot": ["browser_inspect", "screenshot"],
-  "inspect.console": ["browser_inspect", "console"],
-  "inspect.network": ["browser_inspect", "network"],
-  "inspect.debug": ["browser_inspect", "debug"],
-  "interact.click": ["browser_interact", "click"],
-  "interact.hover": ["browser_interact", "hover"],
-  "interact.wheel": ["browser_interact", "wheel"],
-  "interact.scroll-to": ["browser_interact", "scroll-to"],
-  "interact.focus": ["browser_interact", "focus"],
-  "interact.blur": ["browser_interact", "blur"],
-  "interact.fill": ["browser_interact", "fill"],
-  "interact.select": ["browser_interact", "select"],
-  "interact.press": ["browser_interact", "press"],
-  "tabs.list": ["browser_tabs", "list"],
-  "tabs.create": ["browser_tabs", "create"],
-  "tabs.select": ["browser_tabs", "select"],
-  "tabs.close": ["browser_tabs", "close"],
-  "tabs.borrow": ["browser_tabs", "borrow"],
-  "tabs.return": ["browser_tabs", "return"],
-  "assist.resize": ["browser_assist", "resize"],
-  "assist.emulate": ["browser_assist", "emulate"],
-  "assist.request-help": ["browser_assist", "request-help"],
+  "session.start": ["bsk_session", "start"],
+  "session.stop": ["bsk_session", "stop"],
+  "session.list": ["bsk_session", "list"],
+  "page.navigate": ["bsk_page", "navigate"],
+  "page.back": ["bsk_page", "back"],
+  "page.forward": ["bsk_page", "forward"],
+  "page.reload": ["bsk_page", "reload"],
+  "page.wait": ["bsk_page", "wait"],
+  "page.wait-for-element": ["bsk_page", "wait-for-element"],
+  "inspect.observe": ["bsk_inspect", "observe"],
+  "inspect.snapshot": ["bsk_inspect", "snapshot"],
+  "inspect.html": ["bsk_inspect", "html"],
+  "inspect.screenshot": ["bsk_inspect", "screenshot"],
+  "inspect.console": ["bsk_inspect", "console"],
+  "inspect.network": ["bsk_inspect", "network"],
+  "inspect.debug": ["bsk_inspect", "debug"],
+  "interact.click": ["bsk_interact", "click"],
+  "interact.hover": ["bsk_interact", "hover"],
+  "interact.wheel": ["bsk_interact", "wheel"],
+  "interact.scroll-to": ["bsk_interact", "scroll-to"],
+  "interact.focus": ["bsk_interact", "focus"],
+  "interact.blur": ["bsk_interact", "blur"],
+  "interact.fill": ["bsk_interact", "fill"],
+  "interact.select": ["bsk_interact", "select"],
+  "interact.press": ["bsk_interact", "press"],
+  "tabs.list": ["bsk_tabs", "list"],
+  "tabs.create": ["bsk_tabs", "create"],
+  "tabs.select": ["bsk_tabs", "select"],
+  "tabs.close": ["bsk_tabs", "close"],
+  "tabs.borrow": ["bsk_tabs", "borrow"],
+  "tabs.return": ["bsk_tabs", "return"],
+  "assist.resize": ["bsk_assist", "resize"],
+  "assist.emulate": ["bsk_assist", "emulate"],
+  "assist.request-help": ["bsk_assist", "request-help"],
 };
 
 class TestToolRegistry extends Map<string, ToolDefinition> {
@@ -175,7 +175,14 @@ class TestToolRegistry extends Map<string, ToolDefinition> {
 function makeCtx(services: Record<string, unknown> = {}) {
   const tools = new TestToolRegistry();
   const ctx = {
-    tools: { register: (def: ToolDefinition) => tools.set(def.name, def) },
+    tools: {
+      register: (def: ToolDefinition) => {
+        tools.set(def.name, def);
+        return () => {
+          tools.delete(def.name);
+        };
+      },
+    },
     get: (key: string) => services[key],
   };
   return { ctx, tools };
@@ -226,9 +233,9 @@ async function startSession(tools: Map<string, ToolDefinition>, sessionId = "s1"
 const START_REPLY = (id: string) => ({ session_id: id, browser_instance_id: "chrome-1" });
 
 const EXPECTED_ACTIONS = {
-  browser_session: ["start", "stop", "list"],
-  browser_page: ["navigate", "back", "forward", "reload", "wait", "wait-for-element"],
-  browser_inspect: [
+  bsk_session: ["start", "stop", "list"],
+  bsk_page: ["navigate", "back", "forward", "reload", "wait", "wait-for-element"],
+  bsk_inspect: [
     "observe",
     "snapshot",
     "html",
@@ -238,7 +245,7 @@ const EXPECTED_ACTIONS = {
     "debug",
     "video",
   ],
-  browser_interact: [
+  bsk_interact: [
     "click",
     "hover",
     "wheel",
@@ -249,8 +256,8 @@ const EXPECTED_ACTIONS = {
     "select",
     "press",
   ],
-  browser_tabs: ["list", "create", "select", "close", "borrow", "return"],
-  browser_assist: ["resize", "emulate", "request-help"],
+  bsk_tabs: ["list", "create", "select", "close", "borrow", "return"],
+  bsk_assist: ["resize", "emulate", "request-help"],
 } as const;
 
 describe("tool registration", () => {
@@ -267,7 +274,7 @@ describe("tool registration", () => {
 
   it("exposes optional stop targets and retry guidance in the public session schema", () => {
     const { tools } = setup({});
-    const tool = tools.get("browser_session")!;
+    const tool = tools.get("bsk_session")!;
     const properties = tool.parameters.properties as Record<string, unknown> | undefined;
     expect(properties?.requestId).toMatchObject({
       type: "string",
@@ -300,7 +307,7 @@ describe("action dispatch", () => {
   it("rejects actions outside the public contract", async () => {
     const { tools } = setup({});
     await expect(
-      tools.get("browser_page")?.execute({ action: "unsupported" }, makeExec()),
+      tools.get("bsk_page")?.execute({ action: "unsupported" }, makeExec()),
     ).rejects.toThrow(/invalid arguments|unsupported browser action/i);
   });
 
@@ -313,17 +320,17 @@ describe("action dispatch", () => {
       "tab list": { tabs: [] },
       "window resize": { window_id: 9, width: 900, height: 700 },
     });
-    await tools.get("browser_session")?.execute({ action: "start" }, makeExec());
+    await tools.get("bsk_session")?.execute({ action: "start" }, makeExec());
     await tools
-      .get("browser_page")
+      .get("bsk_page")
       ?.execute({ action: "navigate", url: "https://example.test/" }, makeExec());
-    await tools.get("browser_inspect")?.execute({ action: "observe" }, makeExec());
+    await tools.get("bsk_inspect")?.execute({ action: "observe" }, makeExec());
     await tools
-      .get("browser_interact")
+      .get("bsk_interact")
       ?.execute({ action: "fill", target: "@e1", value: "hello" }, makeExec());
-    await tools.get("browser_tabs")?.execute({ action: "list" }, makeExec());
+    await tools.get("bsk_tabs")?.execute({ action: "list" }, makeExec());
     await tools
-      .get("browser_assist")
+      .get("bsk_assist")
       ?.execute({ action: "resize", width: 900, height: 700 }, makeExec());
 
     expect(registry.current()).toBe("s1");
@@ -340,7 +347,7 @@ describe("action dispatch", () => {
   it("keeps action-specific validation in the private operation", async () => {
     const { tools } = setup({});
     await expect(
-      tools.get("browser_page")?.execute({ action: "navigate" }, makeExec()),
+      tools.get("bsk_page")?.execute({ action: "navigate" }, makeExec()),
     ).rejects.toThrow(/url.*required|invalid arguments/i);
   });
 });
@@ -461,7 +468,7 @@ describe("session.start", () => {
     const value = await Promise.race([
       pending,
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("browser_session start never returned")), 2_000),
+        setTimeout(() => reject(new Error("bsk_session start never returned")), 2_000),
       ),
     ]);
     expect(value.sessionId).toBe("s1");
@@ -517,7 +524,7 @@ describe("multi-session behavior", () => {
   it("fails with guidance when no session exists", async () => {
     const { tools } = setup(responses);
     const snapshot = tools.get("inspect.snapshot");
-    await expect(snapshot?.execute({}, makeExec())).rejects.toThrow(/browser_session action=start/);
+    await expect(snapshot?.execute({}, makeExec())).rejects.toThrow(/bsk_session action=start/);
   });
 
   it("enforces the configured session cap before spawning", async () => {
@@ -1876,12 +1883,12 @@ describe("website debug", () => {
       effect: { type: "mock", status: 200, body: '{"value":"$(literal)"}' },
     });
     await tools
-      .get("browser_inspect")!
+      .get("bsk_inspect")!
       .execute({ action: "debug", debugAction: "rule_add", rule }, makeExec());
     expect(calls.at(-1)?.args).toEqual(expect.arrayContaining(["rule_add", "--rule", rule]));
     const replay = JSON.stringify({ key: "attempt-one", body: '{"name":"Bob"}' });
     await tools
-      .get("browser_inspect")!
+      .get("bsk_inspect")!
       .execute({ action: "debug", debugAction: "replay", id: "d1:n1", replay }, makeExec());
     expect(calls.at(-1)?.args).toEqual(
       expect.arrayContaining(["replay", "d1:n1", "--replay", replay]),
@@ -1896,7 +1903,7 @@ describe("website debug", () => {
       },
     });
     await startSession(tools);
-    const result = await tools.get("browser_inspect")!.execute(
+    const result = await tools.get("bsk_inspect")!.execute(
       {
         action: "debug",
         debugAction: "request",
@@ -1925,7 +1932,7 @@ describe("website debug", () => {
     );
     await expect(
       tools
-        .get("browser_inspect")!
+        .get("bsk_inspect")!
         .execute({ action: "debug", debugAction: "status", session: "foreign" }, makeExec()),
     ).rejects.toThrow();
   });
@@ -1936,7 +1943,7 @@ describe("website debug", () => {
       "debug wait": { activity: { wait_complete: true } },
     });
     await startSession(tools);
-    await tools.get("browser_inspect")!.execute(
+    await tools.get("bsk_inspect")!.execute(
       {
         action: "debug",
         debugAction: "requests",
@@ -1962,7 +1969,7 @@ describe("website debug", () => {
       ]),
     );
     await tools
-      .get("browser_inspect")!
+      .get("bsk_inspect")!
       .execute(
         { action: "debug", debugAction: "wait", commandId: "active", waitMs: 60000 },
         makeExec(),
@@ -1972,7 +1979,7 @@ describe("website debug", () => {
     );
     expect(
       tools
-        .get("browser_inspect")!
+        .get("bsk_inspect")!
         .isConcurrencySafe?.({ action: "debug", debugAction: "wait" } as never),
     ).toBe(true);
     expect(calls.at(-1)!.options.tag).toBeUndefined();
@@ -1986,7 +1993,7 @@ describe("website debug", () => {
       "debug duplicates": { duplicates: [] },
     });
     await startSession(tools);
-    const inspect = tools.get("browser_inspect")!;
+    const inspect = tools.get("bsk_inspect")!;
     await inspect.execute({ action: "debug", debugAction: "performance" }, makeExec());
     expect(calls.at(-1)!.args).toEqual(["debug", "performance", "--session", "s1"]);
     await inspect.execute(
@@ -2027,7 +2034,7 @@ describe("website debug", () => {
       { debugAction: "aggregate", since: 1 },
     ])
       await expect(
-        tools.get("browser_inspect")!.execute({ action: "debug", ...args }, makeExec()),
+        tools.get("bsk_inspect")!.execute({ action: "debug", ...args }, makeExec()),
       ).rejects.toThrow();
     expect(calls).toHaveLength(0);
   });
