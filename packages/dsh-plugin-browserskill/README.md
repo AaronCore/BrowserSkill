@@ -87,7 +87,7 @@ version coordinated by the release process, rather than as a patch to 0.3.2.
 | --- | --- | --- |
 | `bsk_session` | `start`, `stop`, `list` | Manage plugin-owned Agent Window sessions. |
 | `bsk_page` | `navigate`, `back`, `forward`, `reload`, `wait`, `wait-for-element` | Navigate the active tab; wait for page lifecycle events or one element condition. |
-| `bsk_inspect` | `observe`, `snapshot`, `html`, `screenshot`, `console`, `network`, `debug`, `video` | Inspect page state, debug websites, and capture screenshots or requested task videos. |
+| `bsk_inspect` | `observe`, `snapshot`, `html`, `screenshot`, `console`, `network`, `debug`, `video`, `extract` | Inspect page state, debug websites, capture screenshots or requested task videos, and export structured tables/lists. |
 | `bsk_interact` | `click`, `hover`, `wheel`, `scroll-to`, `focus`, `blur`, `fill`, `select`, `press` | Interact with controls using fresh refs or selectors. |
 | `bsk_tabs` | `list`, `create`, `select`, `close`, `borrow`, `return` | Manage Agent Window tabs and temporarily borrow user tabs. |
 | `bsk_assist` | `resize`, `emulate`, `request-help` | Resize or emulate the browser and pause for human-only steps. |
@@ -101,6 +101,10 @@ for signed deltas, optional targets, result semantics and interruption.
 
 For `bsk_interact` with `action: "scroll-to"`, see the
 [scroll-to reference](../../docs/scroll-to.md) for parameters, visible bounds and errors.
+
+For `bsk_inspect` with `action: "extract"`, see
+[structured extraction](../../docs/structured-extraction.md) for discovery, list
+fields, JSON/CSV output and loaded-DOM completeness.
 
 Arbitrary page-script evaluation and interaction recording are not supported.
 
