@@ -59,8 +59,7 @@ induced to do is done with their sessions.
    [profile instructions](references/tabs-and-profiles.md) and start with its explicit `--browser`
    selector. Otherwise start `bsk session start --json`; with multiple browsers,
    run `bsk browsers` and choose `--browser <id-or-label>`. Retain the returned
-   `session_id`. Sessions open in the background by default. Use `--focus` only
-   when the user explicitly requests a foreground window.
+   `session_id`. Sessions start in the background; use `--focus` only on explicit user request.
 2. For a new page, navigate; for an existing user tab, read [tab borrowing](references/tabs-and-profiles.md) first.
    Read the page before interacting:
 
