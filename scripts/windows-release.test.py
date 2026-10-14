@@ -31,6 +31,16 @@ class ReleaseTests(unittest.TestCase):
         api.request('releases/assets/1', binary=True, accept='application/octet-stream')
         self.assertEqual(api.opener.open.call_args.args[0].get_header('Accept'), 'application/octet-stream')
 
+    def test_repository_metadata_url_has_no_trailing_slash(self):
+        with patch.dict('os.environ', {'GH_TOKEN': 'test'}):
+            api = release.GitHub()
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"default_branch":"main"}'
+        api.opener = MagicMock()
+        api.opener.open.return_value = response
+        self.assertEqual(api.request('')['default_branch'], 'main')
+        self.assertEqual(api.opener.open.call_args.args[0].full_url, 'https://api.github.com/repos/Tencent/BrowserSkill')
+
     def test_source_identity_and_success_are_required(self):
         release.validate_run(self.run_record(), 'cli-v1.2.3', 'a' * 40, 2)
         invalid = [dict(head_repository={'full_name': 'attacker/BrowserSkill'}), dict(path='.github/workflows/ci.yml'),

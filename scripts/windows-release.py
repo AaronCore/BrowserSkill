@@ -52,7 +52,7 @@ class GitHub:
         self.opener = build_opener(SafeRedirect())
 
     def request(self, path, method='GET', data=None, binary=False, accept=None):
-        url = path if path.startswith('https://') else f'https://api.github.com/repos/{REPO}/{path}'
+        url = path if path.startswith('https://') else f'https://api.github.com/repos/{REPO}' + (f'/{path}' if path else '')
         require(urlparse(url).hostname in ('api.github.com', 'uploads.github.com'), 'Unexpected GitHub API host')
         headers = {'Authorization': f'Bearer {self.token}', 'User-Agent': 'BrowserSkill-release',
                    'Accept': accept or 'application/vnd.github+json',
