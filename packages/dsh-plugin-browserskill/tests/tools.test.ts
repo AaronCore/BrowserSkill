@@ -370,9 +370,12 @@ describe("session.start", () => {
     [false, "--focus"],
   ])("maps noFocus=%s to %s", async (noFocus, flag) => {
     const { tools, calls } = setup({ "session start": START_REPLY("s1") });
-    await tools
-      .get("browser_session")
-      ?.execute({ action: "start", ...(noFocus === undefined ? {} : { noFocus }) }, makeExec());
+    const tool = tools.get("bsk_session");
+    if (!tool) throw new Error("bsk_session not registered");
+    await tool.execute(
+      { action: "start", ...(noFocus === undefined ? {} : { noFocus }) },
+      makeExec(),
+    );
     expect(calls[0].args.filter((arg) => arg === "--focus" || arg === "--no-focus")).toEqual(
       flag ? [flag] : [],
     );
